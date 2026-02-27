@@ -31,3 +31,5 @@ _testmain.go
 *.prof
 
 /client_conf.json
+/acltest
+/cmd/acltest/

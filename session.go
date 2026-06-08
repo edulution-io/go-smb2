@@ -302,6 +302,15 @@ func (s *session) recv(rr *requestResponse) (pkt []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
+	// A closed or dead connection can surface as a short or zero-length packet
+	// with a nil error. Guard before reading header fields: PacketCodec
+	// accessors slice at fixed offsets (e.g. SessionId reads pkt[40:48]) and
+	// would otherwise panic with "slice bounds out of range" on a short buffer,
+	// crashing any goroutine without a recover. IsInvalid() checks len < 64 and
+	// the SMB2 magic.
+	if PacketCodec(pkt).IsInvalid() {
+		return nil, &InvalidResponseError{fmt.Sprintf("invalid response packet (length %d)", len(pkt))}
+	}
 	if sessionId := PacketCodec(pkt).SessionId(); sessionId != s.sessionId {
 		return nil, &InvalidResponseError{fmt.Sprintf("expected session id: %v, got %v", s.sessionId, sessionId)}
 	}

@@ -16,6 +16,15 @@ func buildLookupSidsResponse(stub []byte, fragLength, authLength uint16) []byte 
 	return b
 }
 
+// buildAuthenticatedResponse builds a response PDU whose stub is followed by
+// padLength padding bytes, an 8-byte sec_trailer and an authLength-byte token.
+func buildAuthenticatedResponse(stub []byte, padLength, authLength int) []byte {
+	verifier := make([]byte, padLength+8+authLength)
+	verifier[padLength+2] = byte(padLength) // sec_trailer.auth_pad_length
+	body := append(append([]byte{}, stub...), verifier...)
+	return buildLookupSidsResponse(body, uint16(24+len(body)), uint16(authLength))
+}
+
 func TestLsarLookupSidsResponseDecoderReturnValue(t *testing.T) {
 	// Minimal well-formed stub: no referenced domains, no translated names, then
 	// MappedCount and the NTSTATUS.
@@ -48,13 +57,23 @@ func TestLsarLookupSidsResponseDecoderReturnValue(t *testing.T) {
 			want: 0x00000107,
 		},
 		{
-			// An auth verifier is 8 header bytes plus AuthLength trailer bytes, all
-			// of which sit behind the status.
+			// An auth verifier is an 8-byte sec_trailer plus AuthLength token bytes,
+			// all of which sit behind the status.
 			name: "auth verifier is skipped",
-			pdu: buildLookupSidsResponse(
-				append(append([]byte{}, stub...), make([]byte, 8+16)...),
-				uint16(24+len(stub)+8+16), 16),
+			pdu:  buildAuthenticatedResponse(stub, 0, 16),
 			want: 0x00000107,
+		},
+		{
+			// auth_pad_length bytes sit between the stub and the sec_trailer and are
+			// not counted by AuthLength; missing them reads padding as the status.
+			name: "auth padding is skipped",
+			pdu:  buildAuthenticatedResponse(stub, 12, 16),
+			want: 0x00000107,
+		},
+		{
+			name: "auth verifier larger than the pdu",
+			pdu:  buildLookupSidsResponse(stub, uint16(24+len(stub)), 0xffff),
+			want: 0xFFFFFFFF,
 		},
 		{
 			name: "pdu too short to carry a status",

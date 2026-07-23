@@ -327,9 +327,16 @@ func (r LsarLookupSidsResponseDecoder) ReturnValue() uint32 {
 	if fragLen := int(le.Uint16(r[8:10])); fragLen >= 28 && fragLen <= len(r) {
 		end = fragLen
 	}
-	// An auth verifier, when present, is an 8-byte header plus AuthLength bytes.
+	// An auth verifier, when present, is an 8-byte sec_trailer plus AuthLength
+	// token bytes. The stub is padded up to the trailer, and that padding is not
+	// covered by AuthLength: its size lives in the trailer's auth_pad_length byte,
+	// so the trailer has to be located before the stub end is known.
 	if authLen := int(le.Uint16(r[10:12])); authLen > 0 {
-		end -= authLen + 8
+		trailer := end - authLen - 8
+		if trailer < 24 {
+			return 0xFFFFFFFF
+		}
+		end = trailer - int(r[trailer+2]) // auth_pad_length
 	}
 	// The smallest stub this call can produce is 20 bytes: a null ReferencedDomains
 	// pointer, an empty TranslatedNames (count + null pointer), MappedCount, and the

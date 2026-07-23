@@ -514,10 +514,9 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error
 		return nil, &InvalidResponseError{"broken lsarpc lookup sids response"}
 	}
 
-	// TODO: reassemble fragments. PFC_LAST_FRAG is never checked, so a batch whose
-	// reply exceeds the negotiated fragment size is decoded from its first fragment
-	// alone: Results errors out and the status check below reads stub bytes rather
-	// than the NTSTATUS. Callers should keep batches small until this is handled.
+	// TODO: reassemble fragments. A reply exceeding the negotiated fragment size
+	// arrives as a first fragment this client never continues; the decoder refuses
+	// to read a status out of it, so it fails cleanly rather than silently.
 
 	// SOME_NOT_MAPPED and NONE_MAPPED are answers, not failures: the arrays are
 	// valid and the unmapped entries come back typed as Unknown. Any other status
@@ -526,9 +525,8 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error
 	// no error at all.
 	rv := lookupResp.ReturnValue()
 	if rv == msrpc.NoReturnValue {
-		// A framing problem on our side, not a verdict from the DC -- say so, rather
-		// than reporting 0xFFFFFFFF as if the server had sent it.
-		return nil, &InvalidResponseError{"lsarpc lookup sids response too short to carry a status"}
+		// Framing, not a verdict from the DC: do not report 0xFFFFFFFF as a status.
+		return nil, &InvalidResponseError{"lsarpc lookup sids response carried no status"}
 	}
 	switch status := NtStatus(rv); status {
 	case STATUS_SUCCESS, STATUS_SOME_NOT_MAPPED, STATUS_NONE_MAPPED:

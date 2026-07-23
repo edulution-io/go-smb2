@@ -42,10 +42,10 @@ const (
 	lookupSidsMinStub = 20
 )
 
-// NoReturnValue is what ReturnValue reports when the PDU is too short to carry a
-// status. It is not a valid NTSTATUS, so a truncated response cannot be mistaken
-// for STATUS_SUCCESS; callers should treat it as a framing error rather than as a
-// verdict from the server.
+// NoReturnValue is what a ReturnValue method reports when the PDU does not carry
+// a status it can read. It is not a valid NTSTATUS, so a truncated or fragmented
+// response cannot be mistaken for STATUS_SUCCESS; callers should treat it as a
+// framing error rather than as a verdict from the server.
 const NoReturnValue uint32 = 0xFFFFFFFF
 
 // ----------------------------------------------------------------------------
@@ -172,7 +172,13 @@ func (r LsarOpenPolicy2ResponseDecoder) PolicyHandle() []byte {
 	return r[24:44]
 }
 
+// ReturnValue returns the NTSTATUS that follows the policy handle, or
+// NoReturnValue when the PDU is too short to carry one. Guarded here rather than
+// left to IsInvalid, because the method is exported.
 func (r LsarOpenPolicy2ResponseDecoder) ReturnValue() uint32 {
+	if len(r) < 48 {
+		return NoReturnValue
+	}
 	return le.Uint32(r[44:48])
 }
 
@@ -357,54 +363,75 @@ func (r LsarLookupSidsResponseDecoder) CallId() uint32 {
 	return le.Uint32(r[12:16])
 }
 
-// ReturnValue returns the NTSTATUS the server appended to the stub data.
+// stubEnd reports where the stub data ends, and whether the PDU carries a
+// complete final fragment at all.
 //
-// The status is the stub's last field, so it is located from the end rather than
-// by walking the payload: everything before it is variable length, and a caller
-// that needs the status usually needs it precisely because the payload did not
-// parse the way it expected.
-//
-// Returns NoReturnValue when the PDU is too short to carry a status, so a
-// truncated response cannot be mistaken for STATUS_SUCCESS.
-//
-// The status belongs to the last fragment of a response. This client never
-// reassembles fragments (see the max recv frag the bind advertises), so on a
-// response the server split up, the bytes read here are the first fragment's
-// trailing stub bytes rather than a status. Results reports such a payload as an
-// error either way, but the check below is only as strong as the framing.
-func (r LsarLookupSidsResponseDecoder) ReturnValue() uint32 {
-	// The reads below are unguarded past this point; IsInvalid enforces the same
-	// minimum, but this method is exported and must hold up on its own.
+// ReturnValue and Results both go through here so they agree on the stub extent:
+// the buffer can hold more than the PDU, since the STATUS_BUFFER_OVERFLOW re-read
+// appends a full transact's worth. The header reads are guarded here rather than
+// left to IsInvalid, because both callers are exported.
+func (r LsarLookupSidsResponseDecoder) stubEnd() (int, bool) {
 	if len(r) < rpcHeaderLen+lookupSidsMinStub {
-		return NoReturnValue
+		return 0, false
+	}
+	// The status is the last field of the last fragment, and this client does not
+	// reassemble; the tail of a non-final fragment is stub payload.
+	if r[3]&RPC_PACKET_FLAG_LAST == 0 {
+		return 0, false
+	}
+	// Declared longer than what arrived: truncation. Falling back to the buffer
+	// end would read a zero-padded stub as STATUS_SUCCESS.
+	fragLen := int(le.Uint16(r[8:10]))
+	if fragLen > len(r) {
+		return 0, false
 	}
 	end := len(r)
-	if fragLen := int(le.Uint16(r[8:10])); fragLen >= rpcHeaderLen && fragLen <= len(r) {
+	if fragLen >= rpcHeaderLen {
 		end = fragLen
 	}
-	// An auth verifier, when present, is an 8-byte sec_trailer plus AuthLength
-	// token bytes. The stub is padded up to the trailer, and that padding is not
-	// covered by AuthLength: its size lives in the trailer's auth_pad_length byte,
-	// so the trailer has to be located before the stub end is known.
+	// An auth verifier is padding plus an 8-byte sec_trailer plus AuthLength token
+	// bytes. AuthLength covers only the token, so the trailer has to be located
+	// before the padding it declares can be subtracted.
 	if authLen := int(le.Uint16(r[10:12])); authLen > 0 {
 		trailer := end - authLen - 8
 		if trailer < rpcHeaderLen {
-			return NoReturnValue
+			return 0, false
 		}
 		end = trailer - int(r[trailer+2]) // auth_pad_length
 	}
-	// Anything shorter than the minimum stub is truncated, and reporting its last
-	// 4 bytes as the status would let a cut-off response read as STATUS_SUCCESS.
 	if end < rpcHeaderLen+lookupSidsMinStub {
+		return 0, false
+	}
+	return end, true
+}
+
+// ReturnValue returns the NTSTATUS the server appended to the stub data.
+//
+// The status is the stub's last field, so it is located from the end rather than
+// by walking the variable-length payload before it.
+//
+// Returns NoReturnValue when the PDU carries no status to read -- too short,
+// shorter than it declares, or not the final fragment -- so no framing failure
+// reads as STATUS_SUCCESS.
+func (r LsarLookupSidsResponseDecoder) ReturnValue() uint32 {
+	end, ok := r.stubEnd()
+	if !ok {
 		return NoReturnValue
 	}
 	return le.Uint32(r[end-4 : end])
 }
 
 // Results parses the referenced domains and translated names from the response.
+//
+// Parsing stops at the declared stub end, so trailing bytes the buffer happens to
+// hold are not read as payload. When the framing does not hold up the whole
+// buffer is parsed, bounded by its length; ReturnValue reports that case.
 func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 	buf := []byte(r)
-	off := 24
+	if end, ok := r.stubEnd(); ok {
+		buf = buf[:end]
+	}
+	off := rpcHeaderLen
 
 	// ReferencedDomains pointer
 	if off+4 > len(buf) {

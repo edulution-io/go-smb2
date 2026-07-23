@@ -6,12 +6,14 @@ import (
 )
 
 // buildLookupSidsResponse builds an RPC response PDU carrying stub bytes, with the
-// header fields ReturnValue reads.
+// header fields ReturnValue reads. The PDU is a complete response in one fragment,
+// which is what a server sends for a reply that fits.
 func buildLookupSidsResponse(stub []byte, fragLength, authLength uint16) []byte {
 	b := make([]byte, 24+len(stub))
 	b[0] = RPC_VERSION
 	b[1] = RPC_VERSION_MINOR
 	b[2] = RPC_TYPE_RESPONSE
+	b[3] = RPC_PACKET_FLAG_FIRST | RPC_PACKET_FLAG_LAST
 	le.PutUint16(b[8:10], fragLength)
 	le.PutUint16(b[10:12], authLength)
 	le.PutUint32(b[12:16], 42) // call id
@@ -26,6 +28,12 @@ func buildAuthenticatedResponse(stub []byte, padLength, authLength int) []byte {
 	verifier[padLength+2] = byte(padLength) // sec_trailer.auth_pad_length
 	body := append(append([]byte{}, stub...), verifier...)
 	return buildLookupSidsResponse(body, uint16(24+len(body)), uint16(authLength))
+}
+
+// withoutLastFragFlag turns a PDU into the first fragment of a fragmented reply.
+func withoutLastFragFlag(pdu []byte) []byte {
+	pdu[3] &^= RPC_PACKET_FLAG_LAST
+	return pdu
 }
 
 func TestLsarLookupSidsResponseDecoderReturnValue(t *testing.T) {
@@ -55,9 +63,19 @@ func TestLsarLookupSidsResponseDecoderReturnValue(t *testing.T) {
 			want: 0x00000107,
 		},
 		{
-			name: "implausible frag length falls back to the buffer end",
+			// The server declared more bytes than arrived. Reading the buffer end
+			// anyway lands wherever the truncation left off -- on a zero-padded stub
+			// that reads as STATUS_SUCCESS, which is the one thing this must never do.
+			name: "frag length longer than the pdu is truncation",
 			pdu:  buildLookupSidsResponse(stub, 0xffff, 0),
-			want: 0x00000107,
+			want: NoReturnValue,
+		},
+		{
+			// The status is the last field of the last fragment, and this client does
+			// not read the rest of a fragmented reply.
+			name: "non-final fragment carries no status",
+			pdu:  withoutLastFragFlag(buildLookupSidsResponse(stub, uint16(24+len(stub)), 0)),
+			want: NoReturnValue,
 		},
 		{
 			// An auth verifier is an 8-byte sec_trailer plus AuthLength token bytes,
@@ -111,6 +129,38 @@ func TestLsarLookupSidsResponseDecoderReturnValueShortBuffer(t *testing.T) {
 	}
 }
 
+// Results must not read past the declared stub end: the STATUS_BUFFER_OVERFLOW
+// re-read appends a whole transact's worth of buffer behind the PDU, and
+// ReturnValue already excludes it.
+func TestResultsStopsAtDeclaredStubEnd(t *testing.T) {
+	stub := []byte{
+		0x00, 0x00, 0x00, 0x00, // ReferencedDomains pointer (null)
+		0x00, 0x00, 0x00, 0x00, // TranslatedNames.Entries
+		0x00, 0x00, 0x00, 0x00, // TranslatedNames pointer (null)
+		0x00, 0x00, 0x00, 0x00, // MappedCount
+		0x00, 0x00, 0x00, 0x00, // STATUS_SUCCESS
+	}
+	fragLen := uint16(24 + len(stub))
+
+	// A second PDU's worth of bytes behind the first, as a short re-read leaves.
+	trailing := make([]byte, 64)
+	for i := range trailing {
+		trailing[i] = 0xAA
+	}
+	pdu := buildLookupSidsResponse(append(append([]byte{}, stub...), trailing...), fragLen, 0)
+
+	results, err := LsarLookupSidsResponseDecoder(pdu).Results()
+	if err != nil {
+		t.Fatalf("Results() = %v, want the trailing bytes ignored", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("Results() = %d entries, want 0", len(results))
+	}
+	if got := LsarLookupSidsResponseDecoder(pdu).ReturnValue(); got != 0 {
+		t.Errorf("ReturnValue() = 0x%08X, want STATUS_SUCCESS from the same extent", got)
+	}
+}
+
 // buildCountOnlyResponse builds a response whose ReferencedDomains list declares
 // domainCount entries but carries no array behind them.
 func buildCountOnlyResponse(domainCount uint32) []byte {
@@ -149,6 +199,10 @@ func buildNamesCountOnlyResponse(nameCount uint32, namesPtr uint32) []byte {
 // it sizes anything from it -- otherwise a tiny PDU declaring four billion
 // entries has the decoder reserve tens of gigabytes and die on the way to
 // discovering the response is truncated.
+//
+// TotalAlloc is process-wide, so this measures the package's allocations, not
+// this call's: it must stay sequential, and nothing here may allocate in the
+// background. The budget is three orders of magnitude below a regression.
 func TestResultsRejectsUnbackedCountsWithoutAllocating(t *testing.T) {
 	// Large enough that a regression allocates hundreds of megabytes and trips
 	// the budget below, small enough not to kill the test host outright.

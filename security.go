@@ -351,17 +351,23 @@ func (s *Session) LookupSidNames(sids []*Sid) (map[string]SidName, error) {
 		unique[sid.String()] = sid
 	}
 
-	names := make(map[string]SidName, len(unique))
-
 	// Try LSARPC
 	rpcNames, rpcErr := s.lookupSidsRPC(unique)
-	if rpcErr == nil {
-		for k, v := range rpcNames {
-			names[k] = v
-		}
+	if rpcErr != nil {
+		rpcNames = nil
 	}
 
-	// Fill in locally known names for any unresolved SIDs
+	return mergeSidNames(rpcNames, unique), rpcErr
+}
+
+// mergeSidNames lets the DC's translations win and fills every SID it did not
+// translate from the local tables, so the result holds an entry -- possibly an
+// empty one -- for each input SID.
+func mergeSidNames(rpcNames map[string]SidName, unique map[string]*Sid) map[string]SidName {
+	names := make(map[string]SidName, len(unique))
+	for k, v := range rpcNames {
+		names[k] = v
+	}
 	for key, sid := range unique {
 		if _, ok := names[key]; ok {
 			continue
@@ -369,8 +375,7 @@ func (s *Session) LookupSidNames(sids []*Sid) (map[string]SidName, error) {
 		name, source := wellKnownSidName(sid)
 		names[key] = SidName{Name: name, Source: source}
 	}
-
-	return names, rpcErr
+	return names
 }
 
 // LookupSids resolves SIDs to human-readable "DOMAIN\Name" strings via LSARPC.
@@ -384,14 +389,19 @@ func (s *Session) LookupSidNames(sids []*Sid) (map[string]SidName, error) {
 func (s *Session) LookupSids(sids []*Sid) (map[string]string, error) {
 	resolved, err := s.LookupSidNames(sids)
 
+	return namedSids(resolved), err
+}
+
+// namedSids flattens resolved names to the pre-provenance shape: SIDs that
+// resolved to nothing are dropped, whatever their source.
+func namedSids(resolved map[string]SidName) map[string]string {
 	names := make(map[string]string, len(resolved))
 	for key, r := range resolved {
 		if r.Name != "" {
 			names[key] = r.Name
 		}
 	}
-
-	return names, err
+	return names
 }
 
 func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error) {
@@ -449,7 +459,7 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error
 		return nil, &InvalidResponseError{"broken lsarpc open policy2 response"}
 	}
 	if openResp.ReturnValue() != 0 {
-		return nil, &InvalidResponseError{fmt.Sprintf("lsarpc open policy2 failed: 0x%08X", openResp.ReturnValue())}
+		return nil, &InvalidResponseError{fmt.Sprintf("lsarpc open policy2 failed: %v", NtStatus(openResp.ReturnValue()))}
 	}
 
 	policyHandle := make([]byte, 20)
@@ -493,15 +503,26 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error
 		return nil, &InvalidResponseError{"broken lsarpc lookup sids response"}
 	}
 
+	// TODO: reassemble fragments. PFC_LAST_FRAG is never checked, so a batch whose
+	// reply exceeds the negotiated fragment size is decoded from its first fragment
+	// alone: Results errors out and the status check below reads stub bytes rather
+	// than the NTSTATUS. Callers should keep batches small until this is handled.
+
 	// SOME_NOT_MAPPED and NONE_MAPPED are answers, not failures: the arrays are
 	// valid and the unmapped entries come back typed as Unknown. Any other status
 	// means the lookup did not happen, which must not read as "resolved nothing" --
 	// the arrays are then absent and Results would report zero translations with
 	// no error at all.
-	switch status := NtStatus(lookupResp.ReturnValue()); status {
+	rv := lookupResp.ReturnValue()
+	if rv == msrpc.NoReturnValue {
+		// A framing problem on our side, not a verdict from the DC -- say so, rather
+		// than reporting 0xFFFFFFFF as if the server had sent it.
+		return nil, &InvalidResponseError{"lsarpc lookup sids response too short to carry a status"}
+	}
+	switch status := NtStatus(rv); status {
 	case STATUS_SUCCESS, STATUS_SOME_NOT_MAPPED, STATUS_NONE_MAPPED:
 	default:
-		return nil, &InvalidResponseError{fmt.Sprintf("lsarpc lookup sids failed: 0x%08X", uint32(status))}
+		return nil, &InvalidResponseError{fmt.Sprintf("lsarpc lookup sids failed: %v", status)}
 	}
 
 	results, err := lookupResp.Results()
@@ -521,7 +542,13 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error
 		},
 	})
 
-	// Build result map
+	return buildSidNames(results, sidKeys), nil
+}
+
+// buildSidNames keys the translations onto the SIDs they answer. LSARPC returns
+// them positionally, so results[i] belongs to sidKeys[i]; a server that returns
+// more entries than were asked for has nothing left to key them to.
+func buildSidNames(results []msrpc.LookupResult, sidKeys []string) map[string]SidName {
 	names := make(map[string]SidName, len(results))
 	for i, r := range results {
 		if i >= len(sidKeys) {
@@ -540,7 +567,7 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error
 		names[sidKeys[i]] = SidName{Name: name, Type: r.Type, Source: SidNameLSARPC}
 	}
 
-	return names, nil
+	return names
 }
 
 // CollectSids extracts all unique SIDs from a SecurityDescriptor.

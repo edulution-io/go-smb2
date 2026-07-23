@@ -73,12 +73,12 @@ func TestLsarLookupSidsResponseDecoderReturnValue(t *testing.T) {
 		{
 			name: "auth verifier larger than the pdu",
 			pdu:  buildLookupSidsResponse(stub, uint16(24+len(stub)), 0xffff),
-			want: 0xFFFFFFFF,
+			want: NoReturnValue,
 		},
 		{
 			name: "pdu too short to carry a status",
 			pdu:  buildLookupSidsResponse(stub[:len(stub)-4], uint16(24+len(stub)-4), 0),
-			want: 0xFFFFFFFF,
+			want: NoReturnValue,
 		},
 	}
 
@@ -92,5 +92,18 @@ func TestLsarLookupSidsResponseDecoderReturnValue(t *testing.T) {
 				t.Errorf("ReturnValue() = 0x%08X, want 0x%08X", got, tt.want)
 			}
 		})
+	}
+}
+
+// ReturnValue is exported on an exported type, so it has to hold up on a buffer
+// that never passed IsInvalid: every length below the minimum must report
+// NoReturnValue instead of panicking on a header read.
+func TestLsarLookupSidsResponseDecoderReturnValueShortBuffer(t *testing.T) {
+	full := buildLookupSidsResponse(make([]byte, 20), 44, 0)
+
+	for n := 0; n < len(full); n++ {
+		if got := LsarLookupSidsResponseDecoder(full[:n]).ReturnValue(); got != NoReturnValue {
+			t.Errorf("ReturnValue() on %d bytes = 0x%08X, want NoReturnValue", n, got)
+		}
 	}
 }

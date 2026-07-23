@@ -286,8 +286,15 @@ func WellKnownSidName(sid *Sid) string {
 // every host. The RID table holds bare account names (Domain Users) for an
 // arbitrary domain, which are a display convenience and not an identity.
 func wellKnownSidName(sid *Sid) (name string, source SidNameSource) {
-	s := sid.String()
-	if name, ok := wellKnownSids[s]; ok {
+	return wellKnownSidNameFor(sid.String(), sid)
+}
+
+// wellKnownSidNameFor is wellKnownSidName for callers that already hold the SID's
+// string form. Sid.String rebuilds that string from the sub-authorities on every
+// call -- six allocations for a domain SID -- so a caller iterating a map keyed by
+// it should pass the key rather than pay for it twice.
+func wellKnownSidNameFor(key string, sid *Sid) (name string, source SidNameSource) {
+	if name, ok := wellKnownSids[key]; ok {
 		return name, SidNameWellKnown
 	}
 	// Check for domain SID + well-known RID (S-1-5-21-x-x-x-RID)
@@ -372,7 +379,7 @@ func mergeSidNames(rpcNames map[string]SidName, unique map[string]*Sid) map[stri
 		if _, ok := names[key]; ok {
 			continue
 		}
-		name, source := wellKnownSidName(sid)
+		name, source := wellKnownSidNameFor(key, sid)
 		names[key] = SidName{Name: name, Source: source}
 	}
 	return names

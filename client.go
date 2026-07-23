@@ -1029,9 +1029,25 @@ func (fs *Share) loanCredit(payloadSize int) (creditCharge uint16, grantedPayloa
 // it. Response buffers can be shrunk to the grant, sendSize cannot.
 func checkCreditGrant(granted, sendSize int) error {
 	if granted < sendSize {
-		return &InternalError{fmt.Sprintf("granted credits cover %d bytes, less than the %d byte request payload", granted, sendSize)}
+		return &CreditError{Granted: granted, Requested: sendSize}
 	}
 	return nil
+}
+
+// isBufferTooSmall reports whether the server rejected a query because the
+// response did not fit in the buffer the request offered.
+func isBufferTooSmall(err error) bool {
+	rerr, ok := err.(*ResponseError)
+	if !ok {
+		return false
+	}
+
+	switch NtStatus(rerr.Code) {
+	case STATUS_BUFFER_TOO_SMALL, STATUS_BUFFER_OVERFLOW, STATUS_INFO_LENGTH_MISMATCH:
+		return true
+	}
+
+	return false
 }
 
 type File struct {
@@ -1922,11 +1938,14 @@ func (f *File) ioctl(req *IoctlRequest) (output []byte, err error) {
 	}
 
 	if granted < payloadSize {
-		// MaxInputResponse is an allowance the server may use in full, so it
-		// counts against the grant just like the payload being sent.
+		// The output allowance is what is left of the grant once the payload
+		// being sent and MaxInputResponse are accounted for. MaxInputResponse
+		// has to be part of the floor so that subtracting it below cannot
+		// underflow, and the grant has to leave at least one byte for output -
+		// a request offering no room for a response is pointless.
 		floor := f.encodeSize(req.Input) + int(req.OutputCount)
-		if int(req.MaxInputResponse) > floor {
-			floor = int(req.MaxInputResponse)
+		if int(req.MaxInputResponse) >= floor {
+			floor = int(req.MaxInputResponse) + 1
 		}
 		if err = checkCreditGrant(granted, floor); err != nil {
 			return nil, err
@@ -2039,6 +2058,25 @@ func (f *File) queryInfo(req *QueryInfoRequest) (infoBytes []byte, err error) {
 		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
+	outputBufferLength := req.OutputBufferLength
+
+	infoBytes, err = f.queryInfoOnce(req, payloadSize)
+
+	// Unlike readdir, which just gets fewer entries per round trip, a query cut
+	// short by a partial credit grant has no way to pick up the rest. If the
+	// response did not fit in the shrunken buffer, try once more at the size
+	// originally asked for - the balance recovers as outstanding requests
+	// complete, so a second attempt usually gets a full grant.
+	if err != nil && req.OutputBufferLength < outputBufferLength && isBufferTooSmall(err) {
+		req.OutputBufferLength = outputBufferLength
+
+		infoBytes, err = f.queryInfoOnce(req, payloadSize)
+	}
+
+	return infoBytes, err
+}
+
+func (f *File) queryInfoOnce(req *QueryInfoRequest, payloadSize int) (infoBytes []byte, err error) {
 	var granted int
 	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
@@ -2090,7 +2128,10 @@ func (f *File) setInfo(req *SetInfoRequest) (err error) {
 		return err
 	}
 
-	// Set info carries no response buffer, so there is nothing to shrink here.
+	// Set info carries no response buffer, so there is nothing to shrink and
+	// the whole payload has to fit the grant. The check is unguarded on purpose:
+	// a complete grant returns payloadSize and satisfies it trivially, so the
+	// "granted < payloadSize" guard the other paths need would be noise here.
 	if err = checkCreditGrant(granted, payloadSize); err != nil {
 		return err
 	}

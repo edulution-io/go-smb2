@@ -2,6 +2,7 @@ package smb2
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	. "github.com/edulution-io/go-smb2/internal/erref"
@@ -150,6 +151,79 @@ func TestCheckCreditGrantReportsTransient(t *testing.T) {
 	}
 	if !temporary.Temporary() {
 		t.Errorf("Temporary() = false, want true")
+	}
+}
+
+// TestSendRecvRespondedReportsNoResponse covers the contract the charge-back
+// defers depend on: when the request never reaches the wire, sendRecvResponded
+// reports that no response arrived, so the caller has to return its loan
+// itself - conn.tryHandle never saw the request and charged nothing.
+func TestSendRecvRespondedReportsNoResponse(t *testing.T) {
+	connErr := errors.New("connection is dead")
+
+	conn := newTestConn(16)
+	conn.err = connErr
+
+	fs := &Share{
+		treeConn: &treeConn{session: &session{conn: conn}},
+		ctx:      context.Background(),
+	}
+
+	before := len(conn.account.balance)
+
+	res, responded, err := fs.sendRecvResponded(SMB2_QUERY_INFO, new(QueryInfoRequest))
+
+	if !errors.Is(err, connErr) {
+		t.Fatalf("error = %v, want %v", err, connErr)
+	}
+
+	if responded {
+		t.Errorf("responded = true, want false: the request never reached the server")
+	}
+
+	if res != nil {
+		t.Errorf("res = %v, want nil", res)
+	}
+
+	// Nothing was loaned or charged by this call itself.
+	if after := len(conn.account.balance); after != before {
+		t.Errorf("credit balance = %d, want %d unchanged", after, before)
+	}
+}
+
+// TestResponseCreditsAreNotReturnedTwice pins why that contract matters.
+// conn.tryHandle charges the credits a response granted the moment it hands the
+// response over, so a caller that also returns its loan on an error response
+// puts the same credits back twice and ends up believing it holds more than the
+// server ever granted - the failure mode this whole change is about.
+func TestResponseCreditsAreNotReturnedTwice(t *testing.T) {
+	const balance = 16
+
+	conn := newTestConn(balance)
+
+	creditCharge, _, err := conn.loanCredit(4*creditPayload, context.Background())
+	if err != nil {
+		t.Fatalf("loanCredit: unexpected error: %v", err)
+	}
+
+	if got, want := len(conn.account.balance), balance-int(creditCharge); got != want {
+		t.Fatalf("balance after loan = %d, want %d", got, want)
+	}
+
+	// The server answers - an error response grants credits back just like a
+	// successful one - which is what conn.tryHandle books.
+	conn.account.charge(creditCharge, creditCharge)
+
+	if got := len(conn.account.balance); got != balance {
+		t.Fatalf("balance after the response = %d, want the original %d", got, balance)
+	}
+
+	// Returning the loan on top of that is what the unguarded defers used to
+	// do, and it hands out credits the server never granted.
+	conn.chargeCredit(creditCharge)
+
+	if got := len(conn.account.balance); got != balance+int(creditCharge) {
+		t.Fatalf("balance after a second return = %d, want %d", got, balance+int(creditCharge))
 	}
 }
 

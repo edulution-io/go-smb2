@@ -909,9 +909,10 @@ func (fs *Share) createFile(name string, req *CreateRequest, followSymlinks bool
 		return fs.createFileRec(name, req)
 	}
 
+	var responded bool
 	req.CreditCharge, _, err = fs.loanCredit(0)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -921,7 +922,7 @@ func (fs *Share) createFile(name string, req *CreateRequest, followSymlinks bool
 
 	req.Name = name
 
-	res, err := fs.sendRecv(SMB2_CREATE, req)
+	res, responded, err := fs.sendRecvResponded(SMB2_CREATE, req)
 	if err != nil {
 		return nil, err
 	}
@@ -938,10 +939,17 @@ func (fs *Share) createFile(name string, req *CreateRequest, followSymlinks bool
 
 func (fs *Share) createFileRec(name string, req *CreateRequest) (f *File, err error) {
 	for i := 0; i < clientMaxSymlinkDepth; i++ {
-		req.CreditCharge, _, err = fs.loanCredit(0)
+		// creditCharge and responded are per iteration, so that each loan is
+		// returned - or not - on its own merits. A later iteration failing must
+		// not make an earlier one give its credits back a second time.
+		var creditCharge uint16
+		var responded bool
+
+		creditCharge, _, err = fs.loanCredit(0)
+		req.CreditCharge = creditCharge
 		defer func() {
-			if err != nil {
-				fs.chargeCredit(req.CreditCharge)
+			if err != nil && !responded {
+				fs.chargeCredit(creditCharge)
 			}
 		}()
 		if err != nil {
@@ -950,7 +958,7 @@ func (fs *Share) createFileRec(name string, req *CreateRequest) (f *File, err er
 
 		req.Name = name
 
-		res, err := fs.sendRecv(SMB2_CREATE, req)
+		res, responded, err := fs.sendRecvResponded(SMB2_CREATE, req)
 		if err != nil {
 			if rerr, ok := err.(*ResponseError); ok && NtStatus(rerr.Code) == STATUS_STOPPED_ON_SYMLINK {
 				if len(rerr.data) > 0 {
@@ -1005,17 +1013,34 @@ func evalSymlinkError(name string, errData []byte) (string, error) {
 }
 
 func (fs *Share) sendRecv(cmd uint16, req Packet) (res []byte, err error) {
+	res, _, err = fs.sendRecvResponded(cmd, req)
+	return res, err
+}
+
+// sendRecvResponded behaves like sendRecv and additionally reports whether a
+// response packet came back.
+//
+// It exists for the credit accounting. conn.tryHandle charges the credits the
+// server granted the moment it hands a response over, and only then - the path
+// that sets rr.err instead charges nothing. A caller that returns its loan when
+// the call fails must therefore skip that return once a response arrived, or
+// the credits go back twice and the client ends up believing it holds credits
+// the server never granted. Every error accept reports comes from a response
+// that was already charged.
+func (fs *Share) sendRecvResponded(cmd uint16, req Packet) (res []byte, responded bool, err error) {
 	rr, err := fs.send(req, fs.ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	pkt, err := fs.recv(rr)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return accept(cmd, pkt)
+	res, err = accept(cmd, pkt)
+
+	return res, true, err
 }
 
 func (fs *Share) loanCredit(payloadSize int) (creditCharge uint16, grantedPayloadSize int, err error) {
@@ -1252,9 +1277,10 @@ func (f *File) readAt(b []byte, off int64) (n int, err error) {
 }
 
 func (f *File) readAtChunk(n int, off int64) (bs []byte, isEOF bool, err error) {
+	var responded bool
 	creditCharge, m, err := f.fs.loanCredit(n)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(creditCharge)
 		}
 	}()
@@ -1277,7 +1303,7 @@ func (f *File) readAtChunk(n int, off int64) (bs []byte, isEOF bool, err error) 
 
 	req.CreditCharge = creditCharge
 
-	res, err := f.sendRecv(SMB2_READ, req)
+	res, responded, err := f.sendRecvResponded(SMB2_READ, req)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1515,9 +1541,10 @@ func (f *File) Sync() (err error) {
 	req := new(FlushRequest)
 	req.FileId = f.fd
 
+	var responded bool
 	req.CreditCharge, _, err = f.fs.loanCredit(0)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -1525,7 +1552,7 @@ func (f *File) Sync() (err error) {
 		return &os.PathError{Op: "sync", Path: f.name, Err: err}
 	}
 
-	res, err := f.sendRecv(SMB2_FLUSH, req)
+	res, responded, err := f.sendRecvResponded(SMB2_FLUSH, req)
 	if err != nil {
 		return &os.PathError{Op: "sync", Path: f.name, Err: err}
 	}
@@ -1682,9 +1709,10 @@ func (f *File) writeAt(b []byte, off int64) (n int, err error) {
 
 // writeAt allows partial write
 func (f *File) writeAtChunk(b []byte, off int64) (n int, err error) {
+	var responded bool
 	creditCharge, m, err := f.fs.loanCredit(len(b))
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(creditCharge)
 		}
 	}()
@@ -1705,7 +1733,7 @@ func (f *File) writeAtChunk(b []byte, off int64) (n int, err error) {
 
 	req.CreditCharge = creditCharge
 
-	res, err := f.sendRecv(SMB2_WRITE, req)
+	res, responded, err := f.sendRecvResponded(SMB2_WRITE, req)
 	if err != nil {
 		return 0, err
 	}
@@ -1927,9 +1955,10 @@ func (f *File) ioctl(req *IoctlRequest) (output []byte, err error) {
 	}
 
 	var granted int
+	var responded bool
 	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -1955,7 +1984,7 @@ func (f *File) ioctl(req *IoctlRequest) (output []byte, err error) {
 
 	req.FileId = f.fd
 
-	res, err := f.sendRecv(SMB2_IOCTL, req)
+	res, responded, err := f.sendRecvResponded(SMB2_IOCTL, req)
 	if err != nil {
 		r := IoctlResponseDecoder(res)
 		if r.IsInvalid() {
@@ -1988,9 +2017,10 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 	}
 
 	var granted int
+	var responded bool
 	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -2006,7 +2036,7 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 
 	req.FileId = f.fd
 
-	res, err := f.sendRecv(SMB2_QUERY_DIRECTORY, req)
+	res, responded, err := f.sendRecvResponded(SMB2_QUERY_DIRECTORY, req)
 	if err != nil {
 		return nil, err
 	}
@@ -2078,9 +2108,10 @@ func (f *File) queryInfo(req *QueryInfoRequest) (infoBytes []byte, err error) {
 
 func (f *File) queryInfoOnce(req *QueryInfoRequest, payloadSize int) (infoBytes []byte, err error) {
 	var granted int
+	var responded bool
 	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -2097,7 +2128,7 @@ func (f *File) queryInfoOnce(req *QueryInfoRequest, payloadSize int) (infoBytes 
 
 	req.FileId = f.fd
 
-	res, err := f.sendRecv(SMB2_QUERY_INFO, req)
+	res, responded, err := f.sendRecvResponded(SMB2_QUERY_INFO, req)
 	if err != nil {
 		return nil, err
 	}
@@ -2118,9 +2149,10 @@ func (f *File) setInfo(req *SetInfoRequest) (err error) {
 	}
 
 	var granted int
+	var responded bool
 	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -2140,7 +2172,7 @@ func (f *File) setInfo(req *SetInfoRequest) (err error) {
 
 	req.InfoType = SMB2_0_INFO_FILE
 
-	res, err := f.sendRecv(SMB2_SET_INFO, req)
+	res, responded, err := f.sendRecvResponded(SMB2_SET_INFO, req)
 	if err != nil {
 		return err
 	}
@@ -2155,6 +2187,10 @@ func (f *File) setInfo(req *SetInfoRequest) (err error) {
 
 func (f *File) sendRecv(cmd uint16, req Packet) (res []byte, err error) {
 	return f.fs.sendRecv(cmd, req)
+}
+
+func (f *File) sendRecvResponded(cmd uint16, req Packet) (res []byte, responded bool, err error) {
+	return f.fs.sendRecvResponded(cmd, req)
 }
 
 type FileStat struct {

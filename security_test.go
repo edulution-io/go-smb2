@@ -532,6 +532,40 @@ func TestBuildSidNames(t *testing.T) {
 			want:    map[string]SidName{},
 		},
 		{
+			// A backslash in the account name would forge the qualification the
+			// joined string is supposed to carry: with no domain reported, this is
+			// byte-identical to a genuine translation of a CORP domain admin, and
+			// would be handed to the caller stamped SidNameLSARPC.
+			name:    "backslash in the name is not a translation",
+			results: []msrpc.LookupResult{{Name: `CORP\Domain Admins`, Type: SidTypeUser}},
+			keys:    sidKeys,
+			want:    map[string]SidName{},
+		},
+		{
+			// Same forgery from the other half: the join would produce
+			// EVIL\CORP\Administrator, which splits the wrong way.
+			name:    "backslash in the domain is not a translation",
+			results: []msrpc.LookupResult{{Name: "Administrator", Domain: `EVIL\CORP`, Type: SidTypeUser}},
+			keys:    sidKeys,
+			want:    map[string]SidName{},
+		},
+		{
+			name:    "control characters are not a translation",
+			results: []msrpc.LookupResult{{Name: "jdoe\nADMIN: granted", Domain: "CONTOSO", Type: SidTypeUser}},
+			keys:    sidKeys,
+			want:    map[string]SidName{},
+		},
+		{
+			// Rejection must stay narrow: non-ASCII account names are ordinary in a
+			// domain and have to survive.
+			name:    "non-ascii names are kept",
+			results: []msrpc.LookupResult{{Name: "münchner-dienst", Domain: "CONTOSO", Type: SidTypeUser}},
+			keys:    sidKeys,
+			want: map[string]SidName{
+				sidKeys[0]: {Name: `CONTOSO\münchner-dienst`, Type: SidTypeUser, Source: SidNameLSARPC},
+			},
+		},
+		{
 			name: "results are keyed positionally, gaps included",
 			results: []msrpc.LookupResult{
 				{Type: SidTypeUnknown},

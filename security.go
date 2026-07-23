@@ -321,7 +321,11 @@ const (
 	SidNameNone SidNameSource = iota
 
 	// SidNameLSARPC: the domain controller translated it. Name is DOMAIN\Name,
-	// and Type carries the SID_NAME_USE the DC reported.
+	// and Type carries the SID_NAME_USE the DC reported. Neither half contains a
+	// backslash or a control character, so the single separator in Name is the
+	// one this package put there and splitting on it recovers what the DC sent;
+	// a translation that did not hold up to that check is reported as
+	// SidNameNone rather than as an authoritative name.
 	SidNameLSARPC
 
 	// SidNameWellKnown: the static well-known SID table. Name is fully qualified
@@ -567,6 +571,15 @@ func buildSidNames(results []msrpc.LookupResult, sidKeys []string) map[string]Si
 		if r.Name == "" || r.Type == SidTypeUnknown || r.Type == SidTypeInvalid {
 			continue
 		}
+		// Both halves come off the wire, and joining them produces a string callers
+		// are invited to store and compare as an identity. A backslash inside either
+		// half would forge a qualification the server was never given: an account
+		// named `CORP\Domain Admins` with no domain is byte-identical to a genuine
+		// translation from CORP. Neither half is a translation then, so the SID is
+		// left to the local tables like an untranslated one.
+		if !isSidNamePart(r.Name) || (r.Domain != "" && !isSidNamePart(r.Domain)) {
+			continue
+		}
 		name := r.Name
 		if r.Domain != "" {
 			name = r.Domain + `\` + r.Name
@@ -575,6 +588,22 @@ func buildSidNames(results []msrpc.LookupResult, sidKeys []string) map[string]Si
 	}
 
 	return names
+}
+
+// isSidNamePart reports whether s is usable as one half of a DOMAIN\Name pair.
+//
+// It rejects the separator itself, so that the structure of a joined name always
+// reflects what the server actually sent, and rejects C0/C1 control characters,
+// which carry no meaning in an account name and would otherwise reach terminals
+// and log files verbatim. Windows forbids a backslash in a SAM account or domain
+// name, so nothing legitimate is turned away.
+func isSidNamePart(s string) bool {
+	for _, r := range s {
+		if r == '\\' || r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return false
+		}
+	}
+	return true
 }
 
 // CollectSids extracts all unique SIDs from a SecurityDescriptor.

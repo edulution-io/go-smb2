@@ -4,7 +4,6 @@ package smb2
 
 import (
 	"strconv"
-	"strings"
 )
 
 type Filetime struct {
@@ -69,18 +68,26 @@ type Sid struct {
 }
 
 func (sid *Sid) String() string {
-	list := make([]string, 0, 3+len(sid.SubAuthority))
-	list = append(list, "S")
-	list = append(list, strconv.Itoa(int(sid.Revision)))
+	// Formatted into a stack buffer rather than joined from a []string: the join
+	// form allocated the slice plus one string per sub-authority, six allocations
+	// for a typical domain SID, and this is the hot primitive behind every SID map
+	// key. The buffer holds the MS-DTYP maximum of 15 sub-authorities, so it never
+	// has to grow in practice; a longer slice still formats correctly via append.
+	var buf [192]byte
+	b := append(buf[:0], 'S', '-')
+	b = strconv.AppendUint(b, uint64(sid.Revision), 10)
+	b = append(b, '-')
 	if sid.IdentifierAuthority < uint64(1<<32) {
-		list = append(list, strconv.FormatUint(sid.IdentifierAuthority, 10))
+		b = strconv.AppendUint(b, sid.IdentifierAuthority, 10)
 	} else {
-		list = append(list, "0x"+strconv.FormatUint(sid.IdentifierAuthority, 16))
+		b = append(b, '0', 'x')
+		b = strconv.AppendUint(b, sid.IdentifierAuthority, 16)
 	}
 	for _, a := range sid.SubAuthority {
-		list = append(list, strconv.FormatUint(uint64(a), 10))
+		b = append(b, '-')
+		b = strconv.AppendUint(b, uint64(a), 10)
 	}
-	return strings.Join(list, "-")
+	return string(b)
 }
 
 func (sid *Sid) Size() int {

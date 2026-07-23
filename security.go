@@ -320,12 +320,13 @@ const (
 	// SidNameNone: nothing resolved the SID. Name is empty.
 	SidNameNone SidNameSource = iota
 
-	// SidNameLSARPC: the domain controller translated it. Name is DOMAIN\Name,
-	// and Type carries the SID_NAME_USE the DC reported. Neither half contains a
-	// backslash or a control character, so the single separator in Name is the
-	// one this package put there and splitting on it recovers what the DC sent;
-	// a translation that did not hold up to that check is reported as
-	// SidNameNone rather than as an authoritative name.
+	// SidNameLSARPC: the domain controller translated it. Name is DOMAIN\Name --
+	// or the domain alone for a SID that names a domain, which has no account
+	// half -- and Type carries the SID_NAME_USE the DC reported. Neither half
+	// contains a backslash or a control character, so any separator in Name is the
+	// one this package put there and splitting on it recovers what the DC sent; a
+	// translation that did not hold up to that check is reported as SidNameNone
+	// rather than as an authoritative name.
 	SidNameLSARPC
 
 	// SidNameWellKnown: the static well-known SID table. Name is fully qualified
@@ -566,21 +567,27 @@ func buildSidNames(results []msrpc.LookupResult, sidKeys []string) map[string]Si
 		// Unknown and Invalid are the DC saying it could not translate the SID. Any
 		// name attached to them is not a translation, so it is left out and the
 		// local tables get their turn.
-		if r.Name == "" || r.Type == SidTypeUnknown || r.Type == SidTypeInvalid {
+		if r.Type == SidTypeUnknown || r.Type == SidTypeInvalid {
 			continue
 		}
-		// Both halves come off the wire, and joining them produces a string callers
-		// are invited to store and compare as an identity. A backslash inside either
-		// half would forge a qualification the server was never given: an account
-		// named `CORP\Domain Admins` with no domain is byte-identical to a genuine
-		// translation from CORP. Neither half is a translation then, so the SID is
-		// left to the local tables like an untranslated one.
-		if !isSidNamePart(r.Name) || (r.Domain != "" && !isSidNamePart(r.Domain)) {
+		// A backslash in either half forges a qualification the server was never
+		// given: `CORP\Domain Admins` with no domain is byte-identical to a genuine
+		// translation from CORP. Treat it like an untranslated SID.
+		if !isSidNamePart(r.Name) || !isSidNamePart(r.Domain) {
 			continue
 		}
-		name := r.Name
-		if r.Domain != "" {
+
+		var name string
+		switch {
+		case r.Name != "" && r.Domain != "":
 			name = r.Domain + `\` + r.Name
+		case r.Name != "":
+			name = r.Name
+		case r.Type == SidTypeDomain && r.Domain != "":
+			// A domain SID has no account half; the domain is the whole translation.
+			name = r.Domain
+		default:
+			continue
 		}
 		names[sidKeys[i]] = SidName{Name: name, Type: r.Type, Source: SidNameLSARPC}
 	}

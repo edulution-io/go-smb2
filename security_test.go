@@ -532,6 +532,22 @@ func TestBuildSidNames(t *testing.T) {
 			want:    map[string]SidName{},
 		},
 		{
+			// A domain SID has no account half: the DC answers with the type, an empty
+			// name and the referenced domain.
+			name:    "domain sid resolves to the domain name",
+			results: []msrpc.LookupResult{{Domain: "CONTOSO", Type: SidTypeDomain}},
+			keys:    sidKeys,
+			want: map[string]SidName{
+				sidKeys[0]: {Name: "CONTOSO", Type: SidTypeDomain, Source: SidNameLSARPC},
+			},
+		},
+		{
+			name:    "domain sid without a domain is not a translation",
+			results: []msrpc.LookupResult{{Type: SidTypeDomain}},
+			keys:    sidKeys,
+			want:    map[string]SidName{},
+		},
+		{
 			// A backslash in the account name would forge the qualification the
 			// joined string is supposed to carry: with no domain reported, this is
 			// byte-identical to a genuine translation of a CORP domain admin, and

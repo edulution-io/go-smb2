@@ -61,7 +61,7 @@ func buildSecurityDescriptor(control uint16, owner, group, sacl, dacl []byte) []
 	// Header is 20 bytes
 	size := 20 + len(owner) + len(group) + len(sacl) + len(dacl)
 	b := make([]byte, size)
-	b[0] = 1 // Revision
+	b[0] = 1                                              // Revision
 	binary.LittleEndian.PutUint16(b[2:4], control|0x8000) // SE_SELF_RELATIVE
 
 	off := uint32(20)
@@ -147,8 +147,8 @@ func TestParseSecurityDescriptor_AllowDenyACEs(t *testing.T) {
 	everyoneSID := buildSID(1, 1, 0) // S-1-1-0 (Everyone)
 
 	// Deny write to Everyone, Allow read to owner
-	denyACE := buildACE(1, 0, 0x00000002, everyoneSID)  // ACCESS_DENIED, FILE_WRITE_DATA
-	allowACE := buildACE(0, 0, 0x00000001, ownerSID)     // ACCESS_ALLOWED, FILE_READ_DATA
+	denyACE := buildACE(1, 0, 0x00000002, everyoneSID) // ACCESS_DENIED, FILE_WRITE_DATA
+	allowACE := buildACE(0, 0, 0x00000001, ownerSID)   // ACCESS_ALLOWED, FILE_READ_DATA
 	dacl := buildACL(2, denyACE, allowACE)
 
 	sd := buildSecurityDescriptor(0x0004, ownerSID, groupSID, nil, dacl)
@@ -188,14 +188,14 @@ func TestParseSecurityDescriptor_AllowDenyACEs(t *testing.T) {
 func TestParseSecurityDescriptor_MultipleACEs(t *testing.T) {
 	ownerSID := buildSID(1, 5, 21, 100, 200, 300, 1000)
 	groupSID := buildSID(1, 5, 21, 100, 200, 300, 513)
-	adminsSID := buildSID(1, 5, 32, 544)    // S-1-5-32-544 (BUILTIN\Administrators)
-	systemSID := buildSID(1, 5, 18)          // S-1-5-18 (Local System)
-	everyoneSID := buildSID(1, 1, 0)         // S-1-1-0 (Everyone)
+	adminsSID := buildSID(1, 5, 32, 544) // S-1-5-32-544 (BUILTIN\Administrators)
+	systemSID := buildSID(1, 5, 18)      // S-1-5-18 (Local System)
+	everyoneSID := buildSID(1, 1, 0)     // S-1-1-0 (Everyone)
 
-	ace1 := buildACE(0, 0x03, 0x1F01FF, ownerSID)    // Allow Full Control, inherited
-	ace2 := buildACE(0, 0x03, 0x1F01FF, adminsSID)   // Allow Full Control, inherited
-	ace3 := buildACE(0, 0x03, 0x1F01FF, systemSID)   // Allow Full Control, inherited
-	ace4 := buildACE(0, 0, 0x001200A9, everyoneSID)  // Allow Read+Execute
+	ace1 := buildACE(0, 0x03, 0x1F01FF, ownerSID)   // Allow Full Control, inherited
+	ace2 := buildACE(0, 0x03, 0x1F01FF, adminsSID)  // Allow Full Control, inherited
+	ace3 := buildACE(0, 0x03, 0x1F01FF, systemSID)  // Allow Full Control, inherited
+	ace4 := buildACE(0, 0, 0x001200A9, everyoneSID) // Allow Read+Execute
 
 	dacl := buildACL(2, ace1, ace2, ace3, ace4)
 	sd := buildSecurityDescriptor(0x0004, ownerSID, groupSID, nil, dacl)
@@ -292,7 +292,7 @@ func TestParseSecurityDescriptor_ADUserSID(t *testing.T) {
 func TestParseSecurityDescriptor_EmptyDescriptor(t *testing.T) {
 	// Minimal security descriptor: just the 20-byte header with no offsets
 	b := make([]byte, 20)
-	b[0] = 1 // Revision
+	b[0] = 1                                      // Revision
 	binary.LittleEndian.PutUint16(b[2:4], 0x8000) // SE_SELF_RELATIVE
 
 	result, err := parseSecurityDescriptor(b)

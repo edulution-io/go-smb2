@@ -201,14 +201,15 @@ const (
 // SecurityDescriptorDecoder decodes a self-relative security descriptor.
 //
 // Layout (20 bytes minimum):
-//   Offset  Size  Field
-//   0       1     Revision
-//   1       1     Sbz1
-//   2       2     Control
-//   4       4     OffsetOwner
-//   8       4     OffsetGroup
-//   12      4     OffsetSacl
-//   16      4     OffsetDacl
+//
+//	Offset  Size  Field
+//	0       1     Revision
+//	1       1     Sbz1
+//	2       2     Control
+//	4       4     OffsetOwner
+//	8       4     OffsetGroup
+//	12      4     OffsetSacl
+//	16      4     OffsetDacl
 type SecurityDescriptorDecoder []byte
 
 func (sd SecurityDescriptorDecoder) IsInvalid() bool {
@@ -242,12 +243,13 @@ func (sd SecurityDescriptorDecoder) OffsetDacl() uint32 {
 // AclHeaderDecoder decodes an ACL header.
 //
 // Layout (8 bytes):
-//   Offset  Size  Field
-//   0       1     AclRevision
-//   1       1     Sbz1
-//   2       2     AclSize
-//   4       2     AceCount
-//   6       2     Sbz2
+//
+//	Offset  Size  Field
+//	0       1     AclRevision
+//	1       1     Sbz1
+//	2       2     AclSize
+//	4       2     AceCount
+//	6       2     Sbz2
 type AclHeaderDecoder []byte
 
 func (a AclHeaderDecoder) IsInvalid() bool {
@@ -269,12 +271,13 @@ func (a AclHeaderDecoder) AceCount() uint16 {
 // AceDecoder decodes an ACE (Access Control Entry).
 //
 // Layout for ACCESS_ALLOWED_ACE / ACCESS_DENIED_ACE:
-//   Offset  Size  Field
-//   0       1     AceType
-//   1       1     AceFlags
-//   2       2     AceSize
-//   4       4     Mask
-//   8       var   SID
+//
+//	Offset  Size  Field
+//	0       1     AceType
+//	1       1     AceFlags
+//	2       2     AceSize
+//	4       4     Mask
+//	8       var   SID
 type AceDecoder []byte
 
 func (a AceDecoder) IsInvalid() bool {

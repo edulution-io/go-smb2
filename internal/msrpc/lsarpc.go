@@ -100,13 +100,13 @@ type LsarOpenPolicy2Request struct {
 func (r *LsarOpenPolicy2Request) Size() int {
 	nameLen := utf16le.EncodedStringLen(r.ServerName) + 2 // +2 for null terminator
 	count := nameLen / 2
-	off := 24           // RPC header
-	off += 4            // SystemName referent ID
-	off += 4 + 4 + 4    // MaxCount, Offset, ActualCount
-	off += count * 2     // string data
+	off := 24        // RPC header
+	off += 4         // SystemName referent ID
+	off += 4 + 4 + 4 // MaxCount, Offset, ActualCount
+	off += count * 2 // string data
 	off = roundup(off, 4)
-	off += 24           // ObjectAttributes (6 * uint32)
-	off += 4            // DesiredAccess
+	off += 24 // ObjectAttributes (6 * uint32)
+	off += 4  // DesiredAccess
 	return off
 }
 
@@ -117,8 +117,8 @@ func (r *LsarOpenPolicy2Request) Encode(b []byte) {
 	b[3] = RPC_PACKET_FLAG_FIRST | RPC_PACKET_FLAG_LAST
 	b[4] = 0x10
 	le.PutUint32(b[12:16], r.CallId)
-	le.PutUint16(b[20:22], 0)                        // context id
-	le.PutUint16(b[22:24], OP_LSAR_OPEN_POLICY2)     // opnum
+	le.PutUint16(b[20:22], 0)                    // context id
+	le.PutUint16(b[22:24], OP_LSAR_OPEN_POLICY2) // opnum
 
 	off := 24
 
@@ -147,8 +147,8 @@ func (r *LsarOpenPolicy2Request) Encode(b []byte) {
 	le.PutUint32(b[off:], POLICY_LOOKUP_NAMES)
 	off += 4
 
-	le.PutUint16(b[8:10], uint16(off))      // frag length
-	le.PutUint32(b[16:20], uint32(off-24))   // alloc hint
+	le.PutUint16(b[8:10], uint16(off))     // frag length
+	le.PutUint32(b[16:20], uint32(off-24)) // alloc hint
 }
 
 // LsarOpenPolicy2ResponseDecoder decodes the response.
@@ -221,12 +221,12 @@ type LsarLookupSidsRequest struct {
 
 func (r *LsarLookupSidsRequest) Size() int {
 	n := len(r.Sids)
-	off := 24     // RPC header
-	off += 20     // PolicyHandle
-	off += 4      // SidEnumBuffer.Entries
-	off += 4      // SidInfo pointer
-	off += 4      // MaxCount (conformant array)
-	off += n * 4  // SID pointers
+	off := 24    // RPC header
+	off += 20    // PolicyHandle
+	off += 4     // SidEnumBuffer.Entries
+	off += 4     // SidInfo pointer
+	off += 4     // MaxCount (conformant array)
+	off += n * 4 // SID pointers
 	for i := range r.Sids {
 		off += sidNdrSize(&r.Sids[i])
 	}
@@ -247,8 +247,8 @@ func (r *LsarLookupSidsRequest) Encode(b []byte) {
 	b[3] = RPC_PACKET_FLAG_FIRST | RPC_PACKET_FLAG_LAST
 	b[4] = 0x10
 	le.PutUint32(b[12:16], r.CallId)
-	le.PutUint16(b[20:22], 0)                    // context id
-	le.PutUint16(b[22:24], OP_LSAR_LOOKUP_SIDS)  // opnum
+	le.PutUint16(b[20:22], 0)                   // context id
+	le.PutUint16(b[22:24], OP_LSAR_LOOKUP_SIDS) // opnum
 
 	off := 24
 
@@ -306,7 +306,7 @@ func (r *LsarLookupSidsRequest) Encode(b []byte) {
 	le.PutUint32(b[off:], 0)
 	off += 4
 
-	le.PutUint16(b[8:10], uint16(off))    // frag length
+	le.PutUint16(b[8:10], uint16(off))     // frag length
 	le.PutUint32(b[16:20], uint32(off-24)) // alloc hint
 }
 
@@ -622,7 +622,7 @@ func (r *LsarCloseRequest) Encode(b []byte) {
 	b[3] = RPC_PACKET_FLAG_FIRST | RPC_PACKET_FLAG_LAST
 	b[4] = 0x10
 	le.PutUint32(b[12:16], r.CallId)
-	le.PutUint16(b[20:22], 0)            // context id
+	le.PutUint16(b[20:22], 0)             // context id
 	le.PutUint16(b[22:24], OP_LSAR_CLOSE) // opnum
 
 	copy(b[24:44], r.PolicyHandle[:20])

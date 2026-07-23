@@ -1022,6 +1022,18 @@ func (fs *Share) loanCredit(payloadSize int) (creditCharge uint16, grantedPayloa
 	return fs.session.conn.loanCredit(payloadSize, fs.ctx)
 }
 
+// checkCreditGrant reports whether the payload a request has to send fits in
+// what the granted credits cover. loanCredit hands out a partial charge when the
+// credit balance is short, and MS-SMB2 3.3.5.2.5 has the server fail a request
+// whose CreditCharge does not cover the payload it declares instead of queueing
+// it. Response buffers can be shrunk to the grant, sendSize cannot.
+func checkCreditGrant(granted, sendSize int) error {
+	if granted < sendSize {
+		return &InternalError{fmt.Sprintf("granted credits cover %d bytes, less than the %d byte request payload", granted, sendSize)}
+	}
+	return nil
+}
+
 type File struct {
 	fs          *Share
 	fd          *FileId
@@ -1898,7 +1910,8 @@ func (f *File) ioctl(req *IoctlRequest) (output []byte, err error) {
 		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
+	var granted int
+	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
 		if err != nil {
 			f.fs.chargeCredit(req.CreditCharge)
@@ -1906,6 +1919,19 @@ func (f *File) ioctl(req *IoctlRequest) (output []byte, err error) {
 	}()
 	if err != nil {
 		return nil, err
+	}
+
+	if granted < payloadSize {
+		// MaxInputResponse is an allowance the server may use in full, so it
+		// counts against the grant just like the payload being sent.
+		floor := f.encodeSize(req.Input) + int(req.OutputCount)
+		if int(req.MaxInputResponse) > floor {
+			floor = int(req.MaxInputResponse)
+		}
+		if err = checkCreditGrant(granted, floor); err != nil {
+			return nil, err
+		}
+		req.MaxOutputResponse = uint32(granted - int(req.MaxInputResponse))
 	}
 
 	req.FileId = f.fd
@@ -1942,7 +1968,8 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
+	var granted int
+	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
 		if err != nil {
 			f.fs.chargeCredit(req.CreditCharge)
@@ -1950,6 +1977,12 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 	}()
 	if err != nil {
 		return nil, err
+	}
+
+	// A shorter output buffer just means fewer entries per round trip; the
+	// caller reads the rest on the next readdir.
+	if granted < payloadSize {
+		req.OutputBufferLength = uint32(granted)
 	}
 
 	req.FileId = f.fd
@@ -2006,7 +2039,8 @@ func (f *File) queryInfo(req *QueryInfoRequest) (infoBytes []byte, err error) {
 		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
+	var granted int
+	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
 		if err != nil {
 			f.fs.chargeCredit(req.CreditCharge)
@@ -2014,6 +2048,13 @@ func (f *File) queryInfo(req *QueryInfoRequest) (infoBytes []byte, err error) {
 	}()
 	if err != nil {
 		return nil, err
+	}
+
+	if granted < payloadSize {
+		if err = checkCreditGrant(granted, f.encodeSize(req.Input)); err != nil {
+			return nil, err
+		}
+		req.OutputBufferLength = uint32(granted)
 	}
 
 	req.FileId = f.fd
@@ -2038,13 +2079,19 @@ func (f *File) setInfo(req *SetInfoRequest) (err error) {
 		return &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
+	var granted int
+	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
 		if err != nil {
 			f.fs.chargeCredit(req.CreditCharge)
 		}
 	}()
 	if err != nil {
+		return err
+	}
+
+	// Set info carries no response buffer, so there is nothing to shrink here.
+	if err = checkCreditGrant(granted, payloadSize); err != nil {
 		return err
 	}
 

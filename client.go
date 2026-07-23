@@ -909,9 +909,10 @@ func (fs *Share) createFile(name string, req *CreateRequest, followSymlinks bool
 		return fs.createFileRec(name, req)
 	}
 
+	var responded bool
 	req.CreditCharge, _, err = fs.loanCredit(0)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -921,7 +922,7 @@ func (fs *Share) createFile(name string, req *CreateRequest, followSymlinks bool
 
 	req.Name = name
 
-	res, err := fs.sendRecv(SMB2_CREATE, req)
+	res, responded, err := fs.sendRecvResponded(SMB2_CREATE, req)
 	if err != nil {
 		return nil, err
 	}
@@ -938,10 +939,17 @@ func (fs *Share) createFile(name string, req *CreateRequest, followSymlinks bool
 
 func (fs *Share) createFileRec(name string, req *CreateRequest) (f *File, err error) {
 	for i := 0; i < clientMaxSymlinkDepth; i++ {
-		req.CreditCharge, _, err = fs.loanCredit(0)
+		// creditCharge and responded are per iteration, so that each loan is
+		// returned - or not - on its own merits. A later iteration failing must
+		// not make an earlier one give its credits back a second time.
+		var creditCharge uint16
+		var responded bool
+
+		creditCharge, _, err = fs.loanCredit(0)
+		req.CreditCharge = creditCharge
 		defer func() {
-			if err != nil {
-				fs.chargeCredit(req.CreditCharge)
+			if err != nil && !responded {
+				fs.chargeCredit(creditCharge)
 			}
 		}()
 		if err != nil {
@@ -950,7 +958,7 @@ func (fs *Share) createFileRec(name string, req *CreateRequest) (f *File, err er
 
 		req.Name = name
 
-		res, err := fs.sendRecv(SMB2_CREATE, req)
+		res, responded, err := fs.sendRecvResponded(SMB2_CREATE, req)
 		if err != nil {
 			if rerr, ok := err.(*ResponseError); ok && NtStatus(rerr.Code) == STATUS_STOPPED_ON_SYMLINK {
 				if len(rerr.data) > 0 {
@@ -1005,21 +1013,66 @@ func evalSymlinkError(name string, errData []byte) (string, error) {
 }
 
 func (fs *Share) sendRecv(cmd uint16, req Packet) (res []byte, err error) {
+	res, _, err = fs.sendRecvResponded(cmd, req)
+	return res, err
+}
+
+// sendRecvResponded behaves like sendRecv and additionally reports whether a
+// response packet came back.
+//
+// It exists for the credit accounting. conn.tryHandle charges the credits the
+// server granted the moment it hands a response over, and only then - the path
+// that sets rr.err instead charges nothing. A caller that returns its loan when
+// the call fails must therefore skip that return once a response arrived, or
+// the credits go back twice and the client ends up believing it holds credits
+// the server never granted. Every error accept reports comes from a response
+// that was already charged.
+func (fs *Share) sendRecvResponded(cmd uint16, req Packet) (res []byte, responded bool, err error) {
 	rr, err := fs.send(req, fs.ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	pkt, err := fs.recv(rr)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return accept(cmd, pkt)
+	res, err = accept(cmd, pkt)
+
+	return res, true, err
 }
 
 func (fs *Share) loanCredit(payloadSize int) (creditCharge uint16, grantedPayloadSize int, err error) {
 	return fs.session.conn.loanCredit(payloadSize, fs.ctx)
+}
+
+// checkCreditGrant reports whether the payload a request has to send fits in
+// what the granted credits cover. loanCredit hands out a partial charge when the
+// credit balance is short, and MS-SMB2 3.3.5.2.5 has the server fail a request
+// whose CreditCharge does not cover the payload it declares instead of queueing
+// it. Response buffers can be shrunk to the grant, sendSize cannot.
+func checkCreditGrant(granted, sendSize int) error {
+	if granted < sendSize {
+		return &CreditError{Granted: granted, Requested: sendSize}
+	}
+	return nil
+}
+
+// isBufferTooSmall reports whether the server rejected a query because the
+// response did not fit in the buffer the request offered.
+func isBufferTooSmall(err error) bool {
+	rerr, ok := err.(*ResponseError)
+	if !ok {
+		return false
+	}
+
+	switch NtStatus(rerr.Code) {
+	case STATUS_BUFFER_TOO_SMALL, STATUS_BUFFER_OVERFLOW, STATUS_INFO_LENGTH_MISMATCH:
+		return true
+	}
+
+	return false
 }
 
 type File struct {
@@ -1224,9 +1277,10 @@ func (f *File) readAt(b []byte, off int64) (n int, err error) {
 }
 
 func (f *File) readAtChunk(n int, off int64) (bs []byte, isEOF bool, err error) {
+	var responded bool
 	creditCharge, m, err := f.fs.loanCredit(n)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(creditCharge)
 		}
 	}()
@@ -1249,7 +1303,7 @@ func (f *File) readAtChunk(n int, off int64) (bs []byte, isEOF bool, err error) 
 
 	req.CreditCharge = creditCharge
 
-	res, err := f.sendRecv(SMB2_READ, req)
+	res, responded, err := f.sendRecvResponded(SMB2_READ, req)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1487,9 +1541,10 @@ func (f *File) Sync() (err error) {
 	req := new(FlushRequest)
 	req.FileId = f.fd
 
+	var responded bool
 	req.CreditCharge, _, err = f.fs.loanCredit(0)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -1497,7 +1552,7 @@ func (f *File) Sync() (err error) {
 		return &os.PathError{Op: "sync", Path: f.name, Err: err}
 	}
 
-	res, err := f.sendRecv(SMB2_FLUSH, req)
+	res, responded, err := f.sendRecvResponded(SMB2_FLUSH, req)
 	if err != nil {
 		return &os.PathError{Op: "sync", Path: f.name, Err: err}
 	}
@@ -1654,9 +1709,10 @@ func (f *File) writeAt(b []byte, off int64) (n int, err error) {
 
 // writeAt allows partial write
 func (f *File) writeAtChunk(b []byte, off int64) (n int, err error) {
+	var responded bool
 	creditCharge, m, err := f.fs.loanCredit(len(b))
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(creditCharge)
 		}
 	}()
@@ -1677,7 +1733,7 @@ func (f *File) writeAtChunk(b []byte, off int64) (n int, err error) {
 
 	req.CreditCharge = creditCharge
 
-	res, err := f.sendRecv(SMB2_WRITE, req)
+	res, responded, err := f.sendRecvResponded(SMB2_WRITE, req)
 	if err != nil {
 		return 0, err
 	}
@@ -1898,9 +1954,11 @@ func (f *File) ioctl(req *IoctlRequest) (output []byte, err error) {
 		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
+	var granted int
+	var responded bool
+	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -1908,9 +1966,25 @@ func (f *File) ioctl(req *IoctlRequest) (output []byte, err error) {
 		return nil, err
 	}
 
+	if granted < payloadSize {
+		// The output allowance is what is left of the grant once the payload
+		// being sent and MaxInputResponse are accounted for. MaxInputResponse
+		// has to be part of the floor so that subtracting it below cannot
+		// underflow, and the grant has to leave at least one byte for output -
+		// a request offering no room for a response is pointless.
+		floor := f.encodeSize(req.Input) + int(req.OutputCount)
+		if int(req.MaxInputResponse) >= floor {
+			floor = int(req.MaxInputResponse) + 1
+		}
+		if err = checkCreditGrant(granted, floor); err != nil {
+			return nil, err
+		}
+		req.MaxOutputResponse = uint32(granted - int(req.MaxInputResponse))
+	}
+
 	req.FileId = f.fd
 
-	res, err := f.sendRecv(SMB2_IOCTL, req)
+	res, responded, err := f.sendRecvResponded(SMB2_IOCTL, req)
 	if err != nil {
 		r := IoctlResponseDecoder(res)
 		if r.IsInvalid() {
@@ -1942,9 +2016,11 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
+	var granted int
+	var responded bool
+	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -1952,9 +2028,15 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 		return nil, err
 	}
 
+	// A shorter output buffer just means fewer entries per round trip; the
+	// caller reads the rest on the next readdir.
+	if granted < payloadSize {
+		req.OutputBufferLength = uint32(granted)
+	}
+
 	req.FileId = f.fd
 
-	res, err := f.sendRecv(SMB2_QUERY_DIRECTORY, req)
+	res, responded, err := f.sendRecvResponded(SMB2_QUERY_DIRECTORY, req)
 	if err != nil {
 		return nil, err
 	}
@@ -2006,9 +2088,30 @@ func (f *File) queryInfo(req *QueryInfoRequest) (infoBytes []byte, err error) {
 		return nil, &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
+	outputBufferLength := req.OutputBufferLength
+
+	infoBytes, err = f.queryInfoOnce(req, payloadSize)
+
+	// Unlike readdir, which just gets fewer entries per round trip, a query cut
+	// short by a partial credit grant has no way to pick up the rest. If the
+	// response did not fit in the shrunken buffer, try once more at the size
+	// originally asked for - the balance recovers as outstanding requests
+	// complete, so a second attempt usually gets a full grant.
+	if err != nil && req.OutputBufferLength < outputBufferLength && isBufferTooSmall(err) {
+		req.OutputBufferLength = outputBufferLength
+
+		infoBytes, err = f.queryInfoOnce(req, payloadSize)
+	}
+
+	return infoBytes, err
+}
+
+func (f *File) queryInfoOnce(req *QueryInfoRequest, payloadSize int) (infoBytes []byte, err error) {
+	var granted int
+	var responded bool
+	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -2016,9 +2119,16 @@ func (f *File) queryInfo(req *QueryInfoRequest) (infoBytes []byte, err error) {
 		return nil, err
 	}
 
+	if granted < payloadSize {
+		if err = checkCreditGrant(granted, f.encodeSize(req.Input)); err != nil {
+			return nil, err
+		}
+		req.OutputBufferLength = uint32(granted)
+	}
+
 	req.FileId = f.fd
 
-	res, err := f.sendRecv(SMB2_QUERY_INFO, req)
+	res, responded, err := f.sendRecvResponded(SMB2_QUERY_INFO, req)
 	if err != nil {
 		return nil, err
 	}
@@ -2038,9 +2148,11 @@ func (f *File) setInfo(req *SetInfoRequest) (err error) {
 		return &InternalError{fmt.Sprintf("payload size %d exceeds max transact size %d", payloadSize, f.maxTransactSize())}
 	}
 
-	req.CreditCharge, _, err = f.fs.loanCredit(payloadSize)
+	var granted int
+	var responded bool
+	req.CreditCharge, granted, err = f.fs.loanCredit(payloadSize)
 	defer func() {
-		if err != nil {
+		if err != nil && !responded {
 			f.fs.chargeCredit(req.CreditCharge)
 		}
 	}()
@@ -2048,11 +2160,19 @@ func (f *File) setInfo(req *SetInfoRequest) (err error) {
 		return err
 	}
 
+	// Set info carries no response buffer, so there is nothing to shrink and
+	// the whole payload has to fit the grant. The check is unguarded on purpose:
+	// a complete grant returns payloadSize and satisfies it trivially, so the
+	// "granted < payloadSize" guard the other paths need would be noise here.
+	if err = checkCreditGrant(granted, payloadSize); err != nil {
+		return err
+	}
+
 	req.FileId = f.fd
 
 	req.InfoType = SMB2_0_INFO_FILE
 
-	res, err := f.sendRecv(SMB2_SET_INFO, req)
+	res, responded, err := f.sendRecvResponded(SMB2_SET_INFO, req)
 	if err != nil {
 		return err
 	}
@@ -2067,6 +2187,10 @@ func (f *File) setInfo(req *SetInfoRequest) (err error) {
 
 func (f *File) sendRecv(cmd uint16, req Packet) (res []byte, err error) {
 	return f.fs.sendRecv(cmd, req)
+}
+
+func (f *File) sendRecvResponded(cmd uint16, req Packet) (res []byte, responded bool, err error) {
+	return f.fs.sendRecvResponded(cmd, req)
 }
 
 type FileStat struct {

@@ -46,6 +46,25 @@ func (err *ResponseError) Error() string {
 	return fmt.Sprintf("response error: %v", NtStatus(err.Code))
 }
 
+// CreditError represents a request that could not be sent because the credits
+// the connection was able to grant do not cover the payload the request has to
+// send. Unlike InternalError this is a transient condition: the credit balance
+// recovers as outstanding requests complete, so the call is worth retrying.
+type CreditError struct {
+	Granted   int // payload size the granted credits cover
+	Requested int // payload size the request has to send
+}
+
+func (err *CreditError) Error() string {
+	return fmt.Sprintf("credit error: granted credits cover %d bytes, less than the %d byte request payload", err.Granted, err.Requested)
+}
+
+// Temporary reports that the condition is transient, so that callers can tell a
+// credit shortage apart from a permanent failure without matching on strings.
+func (err *CreditError) Temporary() bool {
+	return true
+}
+
 // ContextError wraps a context error to support os.IsTimeout function.
 type ContextError struct {
 	Err error

@@ -193,30 +193,30 @@ func parseACL(b []byte) (*ACL, error) {
 
 // wellKnownSids maps SID strings to human-readable names.
 var wellKnownSids = map[string]string{
-	"S-1-0-0":   "NULL AUTHORITY\\Nobody",
-	"S-1-1-0":   "Everyone",
-	"S-1-2-0":   "LOCAL",
-	"S-1-2-1":   "CONSOLE LOGON",
-	"S-1-3-0":   "CREATOR OWNER",
-	"S-1-3-1":   "CREATOR GROUP",
-	"S-1-3-4":   "OWNER RIGHTS",
-	"S-1-5-1":   "NT AUTHORITY\\Dialup",
-	"S-1-5-2":   "NT AUTHORITY\\Network",
-	"S-1-5-3":   "NT AUTHORITY\\Batch",
-	"S-1-5-4":   "NT AUTHORITY\\Interactive",
-	"S-1-5-6":   "NT AUTHORITY\\Service",
-	"S-1-5-7":   "NT AUTHORITY\\Anonymous Logon",
-	"S-1-5-9":   "NT AUTHORITY\\Enterprise Domain Controllers",
-	"S-1-5-10":  "NT AUTHORITY\\Self",
-	"S-1-5-11":  "NT AUTHORITY\\Authenticated Users",
-	"S-1-5-12":  "NT AUTHORITY\\Restricted",
-	"S-1-5-13":  "NT AUTHORITY\\Terminal Server User",
-	"S-1-5-14":  "NT AUTHORITY\\Remote Interactive Logon",
-	"S-1-5-15":  "NT AUTHORITY\\This Organization",
-	"S-1-5-17":  "NT AUTHORITY\\IUSR",
-	"S-1-5-18":  "NT AUTHORITY\\SYSTEM",
-	"S-1-5-19":  "NT AUTHORITY\\LOCAL SERVICE",
-	"S-1-5-20":  "NT AUTHORITY\\NETWORK SERVICE",
+	"S-1-0-0":      "NULL AUTHORITY\\Nobody",
+	"S-1-1-0":      "Everyone",
+	"S-1-2-0":      "LOCAL",
+	"S-1-2-1":      "CONSOLE LOGON",
+	"S-1-3-0":      "CREATOR OWNER",
+	"S-1-3-1":      "CREATOR GROUP",
+	"S-1-3-4":      "OWNER RIGHTS",
+	"S-1-5-1":      "NT AUTHORITY\\Dialup",
+	"S-1-5-2":      "NT AUTHORITY\\Network",
+	"S-1-5-3":      "NT AUTHORITY\\Batch",
+	"S-1-5-4":      "NT AUTHORITY\\Interactive",
+	"S-1-5-6":      "NT AUTHORITY\\Service",
+	"S-1-5-7":      "NT AUTHORITY\\Anonymous Logon",
+	"S-1-5-9":      "NT AUTHORITY\\Enterprise Domain Controllers",
+	"S-1-5-10":     "NT AUTHORITY\\Self",
+	"S-1-5-11":     "NT AUTHORITY\\Authenticated Users",
+	"S-1-5-12":     "NT AUTHORITY\\Restricted",
+	"S-1-5-13":     "NT AUTHORITY\\Terminal Server User",
+	"S-1-5-14":     "NT AUTHORITY\\Remote Interactive Logon",
+	"S-1-5-15":     "NT AUTHORITY\\This Organization",
+	"S-1-5-17":     "NT AUTHORITY\\IUSR",
+	"S-1-5-18":     "NT AUTHORITY\\SYSTEM",
+	"S-1-5-19":     "NT AUTHORITY\\LOCAL SERVICE",
+	"S-1-5-20":     "NT AUTHORITY\\NETWORK SERVICE",
 	"S-1-5-32-544": "BUILTIN\\Administrators",
 	"S-1-5-32-545": "BUILTIN\\Users",
 	"S-1-5-32-546": "BUILTIN\\Guests",
@@ -270,31 +270,93 @@ var wellKnownRids = map[uint32]string{
 
 // WellKnownSidName returns the human-readable name for a well-known SID.
 // Returns empty string if the SID is not well-known.
+//
+// Callers that persist the name should use LookupSidNames instead: this function
+// cannot tell them that a domain SID's name was derived from its RID and carries
+// no domain prefix.
 func WellKnownSidName(sid *Sid) string {
-	s := sid.String()
-	if name, ok := wellKnownSids[s]; ok {
-		return name
+	name, _ := wellKnownSidName(sid)
+	return name
+}
+
+// wellKnownSidName resolves a SID locally and reports where the name came from.
+//
+// The two sources are not equally good. The static table holds fully qualified,
+// domain-independent names (BUILTIN\Administrators) that mean the same thing on
+// every host. The RID table holds bare account names (Domain Users) for an
+// arbitrary domain, which are a display convenience and not an identity.
+func wellKnownSidName(sid *Sid) (name string, source SidNameSource) {
+	return wellKnownSidNameFor(sid.String(), sid)
+}
+
+// wellKnownSidNameFor is wellKnownSidName for callers that already hold the SID's
+// string form. Sid.String rebuilds that string from the sub-authorities on every
+// call -- six allocations for a domain SID -- so a caller iterating a map keyed by
+// it should pass the key rather than pay for it twice.
+func wellKnownSidNameFor(key string, sid *Sid) (name string, source SidNameSource) {
+	if name, ok := wellKnownSids[key]; ok {
+		return name, SidNameWellKnown
 	}
 	// Check for domain SID + well-known RID (S-1-5-21-x-x-x-RID)
 	if sid.IdentifierAuthority == 5 && len(sid.SubAuthority) >= 5 && sid.SubAuthority[0] == 21 {
 		rid := sid.SubAuthority[len(sid.SubAuthority)-1]
 		if name, ok := wellKnownRids[rid]; ok {
-			return name
+			return name, SidNameDomainRID
 		}
 	}
-	return ""
+	return "", SidNameNone
 }
 
 // ----------------------------------------------------------------------------
 // LSARPC SID Resolution
 //
 
-// LookupSids resolves SIDs to human-readable "DOMAIN\Name" strings via LSARPC.
-// Falls back to well-known SID names when LSARPC fails or doesn't resolve a SID.
-// The returned map is keyed by SID string (e.g. "S-1-5-18").
-func (s *Session) LookupSids(sids []*Sid) (map[string]string, error) {
-	names := make(map[string]string, len(sids))
+// SidNameSource says where a name in a LookupSidNames result came from. It exists
+// so that a caller which persists the name, or matches it against names from
+// another source, can tell an authoritative translation from a local guess.
+type SidNameSource uint8
 
+const (
+	// SidNameNone: nothing resolved the SID. Name is empty.
+	SidNameNone SidNameSource = iota
+
+	// SidNameLSARPC: the domain controller translated it. Name is DOMAIN\Name --
+	// or the domain alone for a SID that names a domain, which has no account
+	// half -- and Type carries the SID_NAME_USE the DC reported. Neither half
+	// contains a backslash or a control character, so any separator in Name is the
+	// one this package put there and splitting on it recovers what the DC sent; a
+	// translation that did not hold up to that check is reported as SidNameNone
+	// rather than as an authoritative name.
+	SidNameLSARPC
+
+	// SidNameWellKnown: the static well-known SID table. Name is fully qualified
+	// and identical on every host, so it is as good as an LSARPC translation.
+	SidNameWellKnown
+
+	// SidNameDomainRID: derived from a domain SID's RID because nothing translated
+	// it. Name is unqualified ("Domain Users"), belongs to an unnamed domain, and
+	// must not be stored or compared as an identity -- only displayed.
+	SidNameDomainRID
+)
+
+// SidName is a resolved SID name together with its provenance.
+type SidName struct {
+	Name   string
+	Type   uint16 // SID_NAME_USE; meaningful only when Source is SidNameLSARPC
+	Source SidNameSource
+}
+
+// LookupSidNames resolves SIDs via LSARPC and reports, per SID, where each name
+// came from. Falls back to locally known names when LSARPC fails or does not
+// translate a SID. The returned map is keyed by SID string (e.g. "S-1-5-18") and
+// holds an entry for every distinct input SID, including unresolved ones.
+//
+// A partial answer is not an error. A domain routinely holds SIDs nothing can
+// translate -- deleted accounts, principals from a domain this DC does not trust
+// -- and failing the batch over them would discard the names that did resolve.
+// The error reports whether the LSARPC leg itself worked; Source reports what
+// each individual name is worth.
+func (s *Session) LookupSidNames(sids []*Sid) (map[string]SidName, error) {
 	// Deduplicate SIDs
 	unique := make(map[string]*Sid, len(sids))
 	for _, sid := range sids {
@@ -303,26 +365,58 @@ func (s *Session) LookupSids(sids []*Sid) (map[string]string, error) {
 
 	// Try LSARPC
 	rpcNames, rpcErr := s.lookupSidsRPC(unique)
-	if rpcErr == nil {
-		for k, v := range rpcNames {
-			names[k] = v
-		}
+	if rpcErr != nil {
+		rpcNames = nil
 	}
 
-	// Fill in well-known names for any unresolved SIDs
+	return mergeSidNames(rpcNames, unique), rpcErr
+}
+
+// mergeSidNames lets the DC's translations win and fills every SID it did not
+// translate from the local tables, so the result holds an entry -- possibly an
+// empty one -- for each input SID.
+func mergeSidNames(rpcNames map[string]SidName, unique map[string]*Sid) map[string]SidName {
+	names := make(map[string]SidName, len(unique))
+	for k, v := range rpcNames {
+		names[k] = v
+	}
 	for key, sid := range unique {
 		if _, ok := names[key]; ok {
 			continue
 		}
-		if name := WellKnownSidName(sid); name != "" {
-			names[key] = name
-		}
+		name, source := wellKnownSidNameFor(key, sid)
+		names[key] = SidName{Name: name, Source: source}
 	}
-
-	return names, rpcErr
+	return names
 }
 
-func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]string, error) {
+// LookupSids resolves SIDs to human-readable "DOMAIN\Name" strings via LSARPC.
+// Falls back to well-known SID names when LSARPC fails or doesn't resolve a SID.
+// The returned map is keyed by SID string (e.g. "S-1-5-18") and omits SIDs that
+// resolved to nothing.
+//
+// Prefer LookupSidNames when the names are stored or compared rather than shown:
+// this map cannot distinguish a name the DC returned from one derived from a SID's
+// RID, and the latter has no domain prefix.
+func (s *Session) LookupSids(sids []*Sid) (map[string]string, error) {
+	resolved, err := s.LookupSidNames(sids)
+
+	return namedSids(resolved), err
+}
+
+// namedSids flattens resolved names to the pre-provenance shape: SIDs that
+// resolved to nothing are dropped, whatever their source.
+func namedSids(resolved map[string]SidName) map[string]string {
+	names := make(map[string]string, len(resolved))
+	for key, r := range resolved {
+		if r.Name != "" {
+			names[key] = r.Name
+		}
+	}
+	return names
+}
+
+func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error) {
 	servername := s.addr
 
 	fs, err := s.Mount(fmt.Sprintf(`\\%s\IPC$`, servername))
@@ -377,7 +471,7 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]string, error)
 		return nil, &InvalidResponseError{"broken lsarpc open policy2 response"}
 	}
 	if openResp.ReturnValue() != 0 {
-		return nil, &InvalidResponseError{fmt.Sprintf("lsarpc open policy2 failed: 0x%08X", openResp.ReturnValue())}
+		return nil, &InvalidResponseError{fmt.Sprintf("lsarpc open policy2 failed: %v", NtStatus(openResp.ReturnValue()))}
 	}
 
 	policyHandle := make([]byte, 20)
@@ -421,6 +515,26 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]string, error)
 		return nil, &InvalidResponseError{"broken lsarpc lookup sids response"}
 	}
 
+	// TODO: reassemble fragments. A reply exceeding the negotiated fragment size
+	// arrives as a first fragment this client never continues; the decoder refuses
+	// to read a status out of it, so it fails cleanly rather than silently.
+
+	// SOME_NOT_MAPPED and NONE_MAPPED are answers, not failures: the arrays are
+	// valid and the unmapped entries come back typed as Unknown. Any other status
+	// means the lookup did not happen, which must not read as "resolved nothing" --
+	// the arrays are then absent and Results would report zero translations with
+	// no error at all.
+	rv := lookupResp.ReturnValue()
+	if rv == msrpc.NoReturnValue {
+		// Framing, not a verdict from the DC: do not report 0xFFFFFFFF as a status.
+		return nil, &InvalidResponseError{"lsarpc lookup sids response carried no status"}
+	}
+	switch status := NtStatus(rv); status {
+	case STATUS_SUCCESS, STATUS_SOME_NOT_MAPPED, STATUS_NONE_MAPPED:
+	default:
+		return nil, &InvalidResponseError{fmt.Sprintf("lsarpc lookup sids failed: %v", status)}
+	}
+
 	results, err := lookupResp.Results()
 	if err != nil {
 		return nil, err
@@ -438,23 +552,63 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]string, error)
 		},
 	})
 
-	// Build result map
-	names := make(map[string]string, len(results))
+	return buildSidNames(results, sidKeys), nil
+}
+
+// buildSidNames keys the translations onto the SIDs they answer. LSARPC returns
+// them positionally, so results[i] belongs to sidKeys[i]; a server that returns
+// more entries than were asked for has nothing left to key them to.
+func buildSidNames(results []msrpc.LookupResult, sidKeys []string) map[string]SidName {
+	names := make(map[string]SidName, len(results))
 	for i, r := range results {
 		if i >= len(sidKeys) {
 			break
 		}
-		if r.Name == "" {
+		// Unknown and Invalid are the DC saying it could not translate the SID. Any
+		// name attached to them is not a translation, so it is left out and the
+		// local tables get their turn.
+		if r.Type == SidTypeUnknown || r.Type == SidTypeInvalid {
 			continue
 		}
-		if r.Domain != "" {
-			names[sidKeys[i]] = r.Domain + `\` + r.Name
-		} else {
-			names[sidKeys[i]] = r.Name
+		// A backslash in either half forges a qualification the server was never
+		// given: `CORP\Domain Admins` with no domain is byte-identical to a genuine
+		// translation from CORP. Treat it like an untranslated SID.
+		if !isSidNamePart(r.Name) || !isSidNamePart(r.Domain) {
+			continue
 		}
+
+		var name string
+		switch {
+		case r.Name != "" && r.Domain != "":
+			name = r.Domain + `\` + r.Name
+		case r.Name != "":
+			name = r.Name
+		case r.Type == SidTypeDomain && r.Domain != "":
+			// A domain SID has no account half; the domain is the whole translation.
+			name = r.Domain
+		default:
+			continue
+		}
+		names[sidKeys[i]] = SidName{Name: name, Type: r.Type, Source: SidNameLSARPC}
 	}
 
-	return names, nil
+	return names
+}
+
+// isSidNamePart reports whether s is usable as one half of a DOMAIN\Name pair.
+//
+// It rejects the separator itself, so that the structure of a joined name always
+// reflects what the server actually sent, and rejects C0/C1 control characters,
+// which carry no meaning in an account name and would otherwise reach terminals
+// and log files verbatim. Windows forbids a backslash in a SAM account or domain
+// name, so nothing legitimate is turned away.
+func isSidNamePart(s string) bool {
+	for _, r := range s {
+		if r == '\\' || r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return false
+		}
+	}
+	return true
 }
 
 // CollectSids extracts all unique SIDs from a SecurityDescriptor.
@@ -505,28 +659,42 @@ func FormatSidShort(sid *Sid, names map[string]string) string {
 	return s
 }
 
+// SID_NAME_USE values, as reported by LSARPC in SidName.Type.
+const (
+	SidTypeUser           uint16 = 1
+	SidTypeGroup          uint16 = 2
+	SidTypeDomain         uint16 = 3
+	SidTypeAlias          uint16 = 4
+	SidTypeWellKnownGroup uint16 = 5
+	SidTypeDeletedAccount uint16 = 6
+	SidTypeInvalid        uint16 = 7
+	SidTypeUnknown        uint16 = 8
+	SidTypeComputer       uint16 = 9
+	SidTypeLabel          uint16 = 10
+)
+
 // SidTypeString returns a human-readable name for SID_NAME_USE values.
 func SidTypeString(t uint16) string {
 	switch t {
-	case 1:
+	case SidTypeUser:
 		return "User"
-	case 2:
+	case SidTypeGroup:
 		return "Group"
-	case 3:
+	case SidTypeDomain:
 		return "Domain"
-	case 4:
+	case SidTypeAlias:
 		return "Alias"
-	case 5:
+	case SidTypeWellKnownGroup:
 		return "WellKnownGroup"
-	case 6:
+	case SidTypeDeletedAccount:
 		return "DeletedAccount"
-	case 7:
+	case SidTypeInvalid:
 		return "Invalid"
-	case 8:
+	case SidTypeUnknown:
 		return "Unknown"
-	case 9:
+	case SidTypeComputer:
 		return "Computer"
-	case 10:
+	case SidTypeLabel:
 		return "Label"
 	default:
 		return fmt.Sprintf("Type(%d)", t)

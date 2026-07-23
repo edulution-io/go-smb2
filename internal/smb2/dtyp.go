@@ -4,7 +4,6 @@ package smb2
 
 import (
 	"strconv"
-	"strings"
 )
 
 type Filetime struct {
@@ -69,18 +68,26 @@ type Sid struct {
 }
 
 func (sid *Sid) String() string {
-	list := make([]string, 0, 3+len(sid.SubAuthority))
-	list = append(list, "S")
-	list = append(list, strconv.Itoa(int(sid.Revision)))
+	// Formatted into a stack buffer rather than joined from a []string: the join
+	// form allocated the slice plus one string per sub-authority, six allocations
+	// for a typical domain SID, and this is the hot primitive behind every SID map
+	// key. The buffer holds the MS-DTYP maximum of 15 sub-authorities, so it never
+	// has to grow in practice; a longer slice still formats correctly via append.
+	var buf [192]byte
+	b := append(buf[:0], 'S', '-')
+	b = strconv.AppendUint(b, uint64(sid.Revision), 10)
+	b = append(b, '-')
 	if sid.IdentifierAuthority < uint64(1<<32) {
-		list = append(list, strconv.FormatUint(sid.IdentifierAuthority, 10))
+		b = strconv.AppendUint(b, sid.IdentifierAuthority, 10)
 	} else {
-		list = append(list, "0x"+strconv.FormatUint(sid.IdentifierAuthority, 16))
+		b = append(b, '0', 'x')
+		b = strconv.AppendUint(b, sid.IdentifierAuthority, 16)
 	}
 	for _, a := range sid.SubAuthority {
-		list = append(list, strconv.FormatUint(uint64(a), 10))
+		b = append(b, '-')
+		b = strconv.AppendUint(b, uint64(a), 10)
 	}
-	return strings.Join(list, "-")
+	return string(b)
 }
 
 func (sid *Sid) Size() int {
@@ -194,14 +201,15 @@ const (
 // SecurityDescriptorDecoder decodes a self-relative security descriptor.
 //
 // Layout (20 bytes minimum):
-//   Offset  Size  Field
-//   0       1     Revision
-//   1       1     Sbz1
-//   2       2     Control
-//   4       4     OffsetOwner
-//   8       4     OffsetGroup
-//   12      4     OffsetSacl
-//   16      4     OffsetDacl
+//
+//	Offset  Size  Field
+//	0       1     Revision
+//	1       1     Sbz1
+//	2       2     Control
+//	4       4     OffsetOwner
+//	8       4     OffsetGroup
+//	12      4     OffsetSacl
+//	16      4     OffsetDacl
 type SecurityDescriptorDecoder []byte
 
 func (sd SecurityDescriptorDecoder) IsInvalid() bool {
@@ -235,12 +243,13 @@ func (sd SecurityDescriptorDecoder) OffsetDacl() uint32 {
 // AclHeaderDecoder decodes an ACL header.
 //
 // Layout (8 bytes):
-//   Offset  Size  Field
-//   0       1     AclRevision
-//   1       1     Sbz1
-//   2       2     AclSize
-//   4       2     AceCount
-//   6       2     Sbz2
+//
+//	Offset  Size  Field
+//	0       1     AclRevision
+//	1       1     Sbz1
+//	2       2     AclSize
+//	4       2     AceCount
+//	6       2     Sbz2
 type AclHeaderDecoder []byte
 
 func (a AclHeaderDecoder) IsInvalid() bool {
@@ -262,12 +271,13 @@ func (a AclHeaderDecoder) AceCount() uint16 {
 // AceDecoder decodes an ACE (Access Control Entry).
 //
 // Layout for ACCESS_ALLOWED_ACE / ACCESS_DENIED_ACE:
-//   Offset  Size  Field
-//   0       1     AceType
-//   1       1     AceFlags
-//   2       2     AceSize
-//   4       4     Mask
-//   8       var   SID
+//
+//	Offset  Size  Field
+//	0       1     AceType
+//	1       1     AceFlags
+//	2       2     AceSize
+//	4       4     Mask
+//	8       var   SID
 type AceDecoder []byte
 
 func (a AceDecoder) IsInvalid() bool {

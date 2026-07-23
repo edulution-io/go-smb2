@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/edulution-io/go-smb2/internal/msrpc"
 	. "github.com/edulution-io/go-smb2/internal/smb2"
 )
 
@@ -60,7 +61,7 @@ func buildSecurityDescriptor(control uint16, owner, group, sacl, dacl []byte) []
 	// Header is 20 bytes
 	size := 20 + len(owner) + len(group) + len(sacl) + len(dacl)
 	b := make([]byte, size)
-	b[0] = 1 // Revision
+	b[0] = 1                                              // Revision
 	binary.LittleEndian.PutUint16(b[2:4], control|0x8000) // SE_SELF_RELATIVE
 
 	off := uint32(20)
@@ -146,8 +147,8 @@ func TestParseSecurityDescriptor_AllowDenyACEs(t *testing.T) {
 	everyoneSID := buildSID(1, 1, 0) // S-1-1-0 (Everyone)
 
 	// Deny write to Everyone, Allow read to owner
-	denyACE := buildACE(1, 0, 0x00000002, everyoneSID)  // ACCESS_DENIED, FILE_WRITE_DATA
-	allowACE := buildACE(0, 0, 0x00000001, ownerSID)     // ACCESS_ALLOWED, FILE_READ_DATA
+	denyACE := buildACE(1, 0, 0x00000002, everyoneSID) // ACCESS_DENIED, FILE_WRITE_DATA
+	allowACE := buildACE(0, 0, 0x00000001, ownerSID)   // ACCESS_ALLOWED, FILE_READ_DATA
 	dacl := buildACL(2, denyACE, allowACE)
 
 	sd := buildSecurityDescriptor(0x0004, ownerSID, groupSID, nil, dacl)
@@ -187,14 +188,14 @@ func TestParseSecurityDescriptor_AllowDenyACEs(t *testing.T) {
 func TestParseSecurityDescriptor_MultipleACEs(t *testing.T) {
 	ownerSID := buildSID(1, 5, 21, 100, 200, 300, 1000)
 	groupSID := buildSID(1, 5, 21, 100, 200, 300, 513)
-	adminsSID := buildSID(1, 5, 32, 544)    // S-1-5-32-544 (BUILTIN\Administrators)
-	systemSID := buildSID(1, 5, 18)          // S-1-5-18 (Local System)
-	everyoneSID := buildSID(1, 1, 0)         // S-1-1-0 (Everyone)
+	adminsSID := buildSID(1, 5, 32, 544) // S-1-5-32-544 (BUILTIN\Administrators)
+	systemSID := buildSID(1, 5, 18)      // S-1-5-18 (Local System)
+	everyoneSID := buildSID(1, 1, 0)     // S-1-1-0 (Everyone)
 
-	ace1 := buildACE(0, 0x03, 0x1F01FF, ownerSID)    // Allow Full Control, inherited
-	ace2 := buildACE(0, 0x03, 0x1F01FF, adminsSID)   // Allow Full Control, inherited
-	ace3 := buildACE(0, 0x03, 0x1F01FF, systemSID)   // Allow Full Control, inherited
-	ace4 := buildACE(0, 0, 0x001200A9, everyoneSID)  // Allow Read+Execute
+	ace1 := buildACE(0, 0x03, 0x1F01FF, ownerSID)   // Allow Full Control, inherited
+	ace2 := buildACE(0, 0x03, 0x1F01FF, adminsSID)  // Allow Full Control, inherited
+	ace3 := buildACE(0, 0x03, 0x1F01FF, systemSID)  // Allow Full Control, inherited
+	ace4 := buildACE(0, 0, 0x001200A9, everyoneSID) // Allow Read+Execute
 
 	dacl := buildACL(2, ace1, ace2, ace3, ace4)
 	sd := buildSecurityDescriptor(0x0004, ownerSID, groupSID, nil, dacl)
@@ -291,7 +292,7 @@ func TestParseSecurityDescriptor_ADUserSID(t *testing.T) {
 func TestParseSecurityDescriptor_EmptyDescriptor(t *testing.T) {
 	// Minimal security descriptor: just the 20-byte header with no offsets
 	b := make([]byte, 20)
-	b[0] = 1 // Revision
+	b[0] = 1                                      // Revision
 	binary.LittleEndian.PutUint16(b[2:4], 0x8000) // SE_SELF_RELATIVE
 
 	result, err := parseSecurityDescriptor(b)
@@ -397,6 +398,45 @@ func TestWellKnownSidName(t *testing.T) {
 	}
 }
 
+// TestWellKnownSidNameSource pins the distinction LookupSidNames is built on: a
+// name from the static table is qualified and portable, a name derived from a
+// domain SID's RID is neither.
+func TestWellKnownSidNameSource(t *testing.T) {
+	tests := []struct {
+		name     string
+		rev      byte
+		auth     uint64
+		sub      []uint32
+		wantName string
+		wantSrc  SidNameSource
+	}{
+		{"static table entry", 1, 5, []uint32{18}, "NT AUTHORITY\\SYSTEM", SidNameWellKnown},
+		{"static table alias", 1, 5, []uint32{32, 544}, "BUILTIN\\Administrators", SidNameWellKnown},
+		{"domain RID guess", 1, 5, []uint32{21, 100, 200, 300, 513}, "Domain Users", SidNameDomainRID},
+		{"domain RID guess admin", 1, 5, []uint32{21, 100, 200, 300, 500}, "Administrator", SidNameDomainRID},
+		{"ordinary domain account", 1, 5, []uint32{21, 100, 200, 300, 1103}, "", SidNameNone},
+		{"non-domain unknown", 1, 5, []uint32{99}, "", SidNameNone},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sid := &Sid{
+				Revision:            tt.rev,
+				IdentifierAuthority: tt.auth,
+				SubAuthority:        tt.sub,
+			}
+			name, src := wellKnownSidName(sid)
+			if name != tt.wantName || src != tt.wantSrc {
+				t.Errorf("wellKnownSidName(%s) = (%q, %v), want (%q, %v)",
+					sid.String(), name, src, tt.wantName, tt.wantSrc)
+			}
+			if got := WellKnownSidName(sid); got != tt.wantName {
+				t.Errorf("WellKnownSidName(%s) = %q, want %q", sid.String(), got, tt.wantName)
+			}
+		})
+	}
+}
+
 func TestCollectSids(t *testing.T) {
 	ownerSID := buildSID(1, 5, 21, 100, 200, 300, 1000)
 	groupSID := buildSID(1, 5, 21, 100, 200, 300, 513)
@@ -443,5 +483,217 @@ func TestFormatSid(t *testing.T) {
 	got = FormatSid(unknown, names)
 	if got != "S-1-5-99" {
 		t.Errorf("FormatSid (unknown) = %q, want %q", got, "S-1-5-99")
+	}
+}
+
+// TestBuildSidNames covers the translation-to-provenance mapping: what counts as
+// an answer from the DC, how the name is qualified, and how results are keyed.
+func TestBuildSidNames(t *testing.T) {
+	sidKeys := []string{"S-1-5-21-100-200-300-1103", "S-1-5-21-100-200-300-1104"}
+
+	tests := []struct {
+		name    string
+		results []msrpc.LookupResult
+		keys    []string
+		want    map[string]SidName
+	}{
+		{
+			name:    "qualified with the domain the dc reported",
+			results: []msrpc.LookupResult{{Name: "jdoe", Domain: "CONTOSO", Type: SidTypeUser}},
+			keys:    sidKeys,
+			want: map[string]SidName{
+				sidKeys[0]: {Name: `CONTOSO\jdoe`, Type: SidTypeUser, Source: SidNameLSARPC},
+			},
+		},
+		{
+			name:    "unqualified when no domain came back",
+			results: []msrpc.LookupResult{{Name: "jdoe", Type: SidTypeUser}},
+			keys:    sidKeys,
+			want: map[string]SidName{
+				sidKeys[0]: {Name: "jdoe", Type: SidTypeUser, Source: SidNameLSARPC},
+			},
+		},
+		{
+			// The case this change exists for: a named translation typed Unknown is
+			// the DC saying it could not translate the SID, so it must not be reported
+			// as an LSARPC answer -- otherwise the local tables never get their turn.
+			name: "unknown and invalid types are not translations",
+			results: []msrpc.LookupResult{
+				{Name: "S-1-5-21-100-200-300-1103", Domain: "CONTOSO", Type: SidTypeUnknown},
+				{Name: "whatever", Domain: "CONTOSO", Type: SidTypeInvalid},
+			},
+			keys: sidKeys,
+			want: map[string]SidName{},
+		},
+		{
+			name:    "empty name is not a translation",
+			results: []msrpc.LookupResult{{Domain: "CONTOSO", Type: SidTypeUser}},
+			keys:    sidKeys,
+			want:    map[string]SidName{},
+		},
+		{
+			// A domain SID has no account half: the DC answers with the type, an empty
+			// name and the referenced domain.
+			name:    "domain sid resolves to the domain name",
+			results: []msrpc.LookupResult{{Domain: "CONTOSO", Type: SidTypeDomain}},
+			keys:    sidKeys,
+			want: map[string]SidName{
+				sidKeys[0]: {Name: "CONTOSO", Type: SidTypeDomain, Source: SidNameLSARPC},
+			},
+		},
+		{
+			name:    "domain sid without a domain is not a translation",
+			results: []msrpc.LookupResult{{Type: SidTypeDomain}},
+			keys:    sidKeys,
+			want:    map[string]SidName{},
+		},
+		{
+			// A backslash in the account name would forge the qualification the
+			// joined string is supposed to carry: with no domain reported, this is
+			// byte-identical to a genuine translation of a CORP domain admin, and
+			// would be handed to the caller stamped SidNameLSARPC.
+			name:    "backslash in the name is not a translation",
+			results: []msrpc.LookupResult{{Name: `CORP\Domain Admins`, Type: SidTypeUser}},
+			keys:    sidKeys,
+			want:    map[string]SidName{},
+		},
+		{
+			// Same forgery from the other half: the join would produce
+			// EVIL\CORP\Administrator, which splits the wrong way.
+			name:    "backslash in the domain is not a translation",
+			results: []msrpc.LookupResult{{Name: "Administrator", Domain: `EVIL\CORP`, Type: SidTypeUser}},
+			keys:    sidKeys,
+			want:    map[string]SidName{},
+		},
+		{
+			name:    "control characters are not a translation",
+			results: []msrpc.LookupResult{{Name: "jdoe\nADMIN: granted", Domain: "CONTOSO", Type: SidTypeUser}},
+			keys:    sidKeys,
+			want:    map[string]SidName{},
+		},
+		{
+			// Rejection must stay narrow: non-ASCII account names are ordinary in a
+			// domain and have to survive.
+			name:    "non-ascii names are kept",
+			results: []msrpc.LookupResult{{Name: "münchner-dienst", Domain: "CONTOSO", Type: SidTypeUser}},
+			keys:    sidKeys,
+			want: map[string]SidName{
+				sidKeys[0]: {Name: `CONTOSO\münchner-dienst`, Type: SidTypeUser, Source: SidNameLSARPC},
+			},
+		},
+		{
+			name: "results are keyed positionally, gaps included",
+			results: []msrpc.LookupResult{
+				{Type: SidTypeUnknown},
+				{Name: "grp", Domain: "CONTOSO", Type: SidTypeGroup},
+			},
+			keys: sidKeys,
+			want: map[string]SidName{
+				sidKeys[1]: {Name: `CONTOSO\grp`, Type: SidTypeGroup, Source: SidNameLSARPC},
+			},
+		},
+		{
+			name: "surplus results have no sid to key them to",
+			results: []msrpc.LookupResult{
+				{Name: "jdoe", Domain: "CONTOSO", Type: SidTypeUser},
+				{Name: "extra", Domain: "CONTOSO", Type: SidTypeUser},
+			},
+			keys: sidKeys[:1],
+			want: map[string]SidName{
+				sidKeys[0]: {Name: `CONTOSO\jdoe`, Type: SidTypeUser, Source: SidNameLSARPC},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := buildSidNames(tt.results, tt.keys)
+			if len(got) != len(tt.want) {
+				t.Fatalf("buildSidNames() = %v, want %v", got, tt.want)
+			}
+			for key, want := range tt.want {
+				if got[key] != want {
+					t.Errorf("buildSidNames()[%q] = %+v, want %+v", key, got[key], want)
+				}
+			}
+		})
+	}
+}
+
+// TestMergeSidNames pins the fallback order: an LSARPC translation wins, and every
+// SID it did not answer is filled from the local tables -- with an empty entry when
+// those do not know it either.
+func TestMergeSidNames(t *testing.T) {
+	var (
+		system    = &Sid{Revision: 1, IdentifierAuthority: 5, SubAuthority: []uint32{18}}
+		domainGrp = &Sid{Revision: 1, IdentifierAuthority: 5, SubAuthority: []uint32{21, 100, 200, 300, 513}}
+		user      = &Sid{Revision: 1, IdentifierAuthority: 5, SubAuthority: []uint32{21, 100, 200, 300, 1103}}
+	)
+
+	unique := map[string]*Sid{
+		system.String():    system,
+		domainGrp.String(): domainGrp,
+		user.String():      user,
+	}
+
+	rpcNames := map[string]SidName{
+		user.String(): {Name: `CONTOSO\jdoe`, Type: SidTypeUser, Source: SidNameLSARPC},
+		// The DC also answers for a SID the static table knows; its answer wins.
+		system.String(): {Name: `CONTOSO\SYSTEM`, Type: SidTypeWellKnownGroup, Source: SidNameLSARPC},
+	}
+
+	want := map[string]SidName{
+		user.String():      {Name: `CONTOSO\jdoe`, Type: SidTypeUser, Source: SidNameLSARPC},
+		system.String():    {Name: `CONTOSO\SYSTEM`, Type: SidTypeWellKnownGroup, Source: SidNameLSARPC},
+		domainGrp.String(): {Name: "Domain Users", Source: SidNameDomainRID},
+	}
+
+	got := mergeSidNames(rpcNames, unique)
+	if len(got) != len(want) {
+		t.Fatalf("mergeSidNames() = %v, want %v", got, want)
+	}
+	for key, w := range want {
+		if got[key] != w {
+			t.Errorf("mergeSidNames()[%q] = %+v, want %+v", key, got[key], w)
+		}
+	}
+
+	// Without an LSARPC leg every SID still gets an entry, empty when nothing knows it.
+	local := mergeSidNames(nil, unique)
+	if len(local) != len(unique) {
+		t.Fatalf("mergeSidNames(nil, ...) returned %d entries, want %d", len(local), len(unique))
+	}
+	if entry := local[user.String()]; entry.Name != "" || entry.Source != SidNameNone {
+		t.Errorf("unresolved SID = %+v, want an empty SidNameNone entry", entry)
+	}
+	if entry := local[system.String()]; entry.Name != `NT AUTHORITY\SYSTEM` || entry.Source != SidNameWellKnown {
+		t.Errorf("well-known SID = %+v, want the static table name", entry)
+	}
+}
+
+// TestNamedSids pins what LookupSids still promises: names only, unresolved SIDs
+// dropped, regardless of where a name came from.
+func TestNamedSids(t *testing.T) {
+	resolved := map[string]SidName{
+		"S-1-5-21-100-200-300-1103": {Name: `CONTOSO\jdoe`, Type: SidTypeUser, Source: SidNameLSARPC},
+		"S-1-5-18":                  {Name: `NT AUTHORITY\SYSTEM`, Source: SidNameWellKnown},
+		"S-1-5-21-100-200-300-513":  {Name: "Domain Users", Source: SidNameDomainRID},
+		"S-1-5-21-100-200-300-1104": {Source: SidNameNone},
+	}
+
+	want := map[string]string{
+		"S-1-5-21-100-200-300-1103": `CONTOSO\jdoe`,
+		"S-1-5-18":                  `NT AUTHORITY\SYSTEM`,
+		"S-1-5-21-100-200-300-513":  "Domain Users",
+	}
+
+	got := namedSids(resolved)
+	if len(got) != len(want) {
+		t.Fatalf("namedSids() = %v, want %v", got, want)
+	}
+	for key, w := range want {
+		if got[key] != w {
+			t.Errorf("namedSids()[%q] = %q, want %q", key, got[key], w)
+		}
 	}
 }

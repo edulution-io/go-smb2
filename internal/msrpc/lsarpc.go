@@ -31,7 +31,22 @@ const (
 	OP_LSAR_OPEN_POLICY2 = 44
 
 	POLICY_LOOKUP_NAMES = 0x00000800
+
+	// rpcHeaderLen is the length of the common DCE/RPC PDU header, i.e. the offset
+	// at which the stub data starts.
+	rpcHeaderLen = 24
+
+	// lookupSidsMinStub is the smallest stub LsarLookupSids can produce: a null
+	// ReferencedDomains pointer, an empty TranslatedNames (count + null pointer),
+	// MappedCount, and the status.
+	lookupSidsMinStub = 20
 )
+
+// NoReturnValue is what a ReturnValue method reports when the PDU does not carry
+// a status it can read. It is not a valid NTSTATUS, so a truncated or fragmented
+// response cannot be mistaken for STATUS_SUCCESS; callers should treat it as a
+// framing error rather than as a verdict from the server.
+const NoReturnValue uint32 = 0xFFFFFFFF
 
 // ----------------------------------------------------------------------------
 // Bind
@@ -85,13 +100,13 @@ type LsarOpenPolicy2Request struct {
 func (r *LsarOpenPolicy2Request) Size() int {
 	nameLen := utf16le.EncodedStringLen(r.ServerName) + 2 // +2 for null terminator
 	count := nameLen / 2
-	off := 24           // RPC header
-	off += 4            // SystemName referent ID
-	off += 4 + 4 + 4    // MaxCount, Offset, ActualCount
-	off += count * 2     // string data
+	off := 24        // RPC header
+	off += 4         // SystemName referent ID
+	off += 4 + 4 + 4 // MaxCount, Offset, ActualCount
+	off += count * 2 // string data
 	off = roundup(off, 4)
-	off += 24           // ObjectAttributes (6 * uint32)
-	off += 4            // DesiredAccess
+	off += 24 // ObjectAttributes (6 * uint32)
+	off += 4  // DesiredAccess
 	return off
 }
 
@@ -102,8 +117,8 @@ func (r *LsarOpenPolicy2Request) Encode(b []byte) {
 	b[3] = RPC_PACKET_FLAG_FIRST | RPC_PACKET_FLAG_LAST
 	b[4] = 0x10
 	le.PutUint32(b[12:16], r.CallId)
-	le.PutUint16(b[20:22], 0)                        // context id
-	le.PutUint16(b[22:24], OP_LSAR_OPEN_POLICY2)     // opnum
+	le.PutUint16(b[20:22], 0)                    // context id
+	le.PutUint16(b[22:24], OP_LSAR_OPEN_POLICY2) // opnum
 
 	off := 24
 
@@ -132,8 +147,8 @@ func (r *LsarOpenPolicy2Request) Encode(b []byte) {
 	le.PutUint32(b[off:], POLICY_LOOKUP_NAMES)
 	off += 4
 
-	le.PutUint16(b[8:10], uint16(off))      // frag length
-	le.PutUint32(b[16:20], uint32(off-24))   // alloc hint
+	le.PutUint16(b[8:10], uint16(off))     // frag length
+	le.PutUint32(b[16:20], uint32(off-24)) // alloc hint
 }
 
 // LsarOpenPolicy2ResponseDecoder decodes the response.
@@ -157,7 +172,13 @@ func (r LsarOpenPolicy2ResponseDecoder) PolicyHandle() []byte {
 	return r[24:44]
 }
 
+// ReturnValue returns the NTSTATUS that follows the policy handle, or
+// NoReturnValue when the PDU is too short to carry one. Guarded here rather than
+// left to IsInvalid, because the method is exported.
 func (r LsarOpenPolicy2ResponseDecoder) ReturnValue() uint32 {
+	if len(r) < 48 {
+		return NoReturnValue
+	}
 	return le.Uint32(r[44:48])
 }
 
@@ -200,12 +221,12 @@ type LsarLookupSidsRequest struct {
 
 func (r *LsarLookupSidsRequest) Size() int {
 	n := len(r.Sids)
-	off := 24     // RPC header
-	off += 20     // PolicyHandle
-	off += 4      // SidEnumBuffer.Entries
-	off += 4      // SidInfo pointer
-	off += 4      // MaxCount (conformant array)
-	off += n * 4  // SID pointers
+	off := 24    // RPC header
+	off += 20    // PolicyHandle
+	off += 4     // SidEnumBuffer.Entries
+	off += 4     // SidInfo pointer
+	off += 4     // MaxCount (conformant array)
+	off += n * 4 // SID pointers
 	for i := range r.Sids {
 		off += sidNdrSize(&r.Sids[i])
 	}
@@ -226,8 +247,8 @@ func (r *LsarLookupSidsRequest) Encode(b []byte) {
 	b[3] = RPC_PACKET_FLAG_FIRST | RPC_PACKET_FLAG_LAST
 	b[4] = 0x10
 	le.PutUint32(b[12:16], r.CallId)
-	le.PutUint16(b[20:22], 0)                    // context id
-	le.PutUint16(b[22:24], OP_LSAR_LOOKUP_SIDS)  // opnum
+	le.PutUint16(b[20:22], 0)                   // context id
+	le.PutUint16(b[22:24], OP_LSAR_LOOKUP_SIDS) // opnum
 
 	off := 24
 
@@ -285,7 +306,7 @@ func (r *LsarLookupSidsRequest) Encode(b []byte) {
 	le.PutUint32(b[off:], 0)
 	off += 4
 
-	le.PutUint16(b[8:10], uint16(off))    // frag length
+	le.PutUint16(b[8:10], uint16(off))     // frag length
 	le.PutUint32(b[16:20], uint32(off-24)) // alloc hint
 }
 
@@ -294,6 +315,35 @@ type LookupResult struct {
 	Name   string // account name
 	Domain string // domain name
 	Type   uint16 // SID_NAME_USE
+}
+
+// NDR element sizes, used to bound a server-declared count against the bytes
+// actually present before anything is sized from it.
+const (
+	// LSAPR_TRUST_INFORMATION: Name(Length+MaximumLength+BufPtr) + SidPtr.
+	trustInfoSize = 12
+
+	// LSAPR_TRANSLATED_NAME: Use + Name.Length + Name.MaximumLength + pad +
+	// BufPtr + DomainIndex.
+	translatedNameSize = 16
+)
+
+// fitsIn reports whether count elements of elemSize bytes each are present in
+// remaining bytes of buffer.
+//
+// Every count in a response is a server-declared uint32 that the payload does
+// not have to back, so it must be checked before it sizes an allocation: a
+// 44-byte PDU declaring four billion entries would otherwise have the decoder
+// reserve tens of gigabytes and die before the length check ever ran.
+//
+// The multiplication is done in 64-bit arithmetic because it overflows int on a
+// 32-bit build, where the product can wrap to a small or negative value and slip
+// past the very check it is meant to fail.
+func fitsIn(count, elemSize, remaining int) bool {
+	if count < 0 || remaining < 0 {
+		return false
+	}
+	return uint64(count)*uint64(elemSize) <= uint64(remaining)
 }
 
 // LsarLookupSidsResponseDecoder parses opnum 15 response.
@@ -313,10 +363,75 @@ func (r LsarLookupSidsResponseDecoder) CallId() uint32 {
 	return le.Uint32(r[12:16])
 }
 
+// stubEnd reports where the stub data ends, and whether the PDU carries a
+// complete final fragment at all.
+//
+// ReturnValue and Results both go through here so they agree on the stub extent:
+// the buffer can hold more than the PDU, since the STATUS_BUFFER_OVERFLOW re-read
+// appends a full transact's worth. The header reads are guarded here rather than
+// left to IsInvalid, because both callers are exported.
+func (r LsarLookupSidsResponseDecoder) stubEnd() (int, bool) {
+	if len(r) < rpcHeaderLen+lookupSidsMinStub {
+		return 0, false
+	}
+	// The status is the last field of the last fragment, and this client does not
+	// reassemble; the tail of a non-final fragment is stub payload.
+	if r[3]&RPC_PACKET_FLAG_LAST == 0 {
+		return 0, false
+	}
+	// Declared longer than what arrived: truncation. Falling back to the buffer
+	// end would read a zero-padded stub as STATUS_SUCCESS.
+	fragLen := int(le.Uint16(r[8:10]))
+	if fragLen > len(r) {
+		return 0, false
+	}
+	end := len(r)
+	if fragLen >= rpcHeaderLen {
+		end = fragLen
+	}
+	// An auth verifier is padding plus an 8-byte sec_trailer plus AuthLength token
+	// bytes. AuthLength covers only the token, so the trailer has to be located
+	// before the padding it declares can be subtracted.
+	if authLen := int(le.Uint16(r[10:12])); authLen > 0 {
+		trailer := end - authLen - 8
+		if trailer < rpcHeaderLen {
+			return 0, false
+		}
+		end = trailer - int(r[trailer+2]) // auth_pad_length
+	}
+	if end < rpcHeaderLen+lookupSidsMinStub {
+		return 0, false
+	}
+	return end, true
+}
+
+// ReturnValue returns the NTSTATUS the server appended to the stub data.
+//
+// The status is the stub's last field, so it is located from the end rather than
+// by walking the variable-length payload before it.
+//
+// Returns NoReturnValue when the PDU carries no status to read -- too short,
+// shorter than it declares, or not the final fragment -- so no framing failure
+// reads as STATUS_SUCCESS.
+func (r LsarLookupSidsResponseDecoder) ReturnValue() uint32 {
+	end, ok := r.stubEnd()
+	if !ok {
+		return NoReturnValue
+	}
+	return le.Uint32(r[end-4 : end])
+}
+
 // Results parses the referenced domains and translated names from the response.
+//
+// Parsing stops at the declared stub end, so trailing bytes the buffer happens to
+// hold are not read as payload. When the framing does not hold up the whole
+// buffer is parsed, bounded by its length; ReturnValue reports that case.
 func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 	buf := []byte(r)
-	off := 24
+	if end, ok := r.stubEnd(); ok {
+		buf = buf[:end]
+	}
+	off := rpcHeaderLen
 
 	// ReferencedDomains pointer
 	if off+4 > len(buf) {
@@ -351,13 +466,14 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 				namePtr uint32
 				sidPtr  uint32
 			}
-			infos := make([]trustInfo, domainCount)
 
-			// LSAPR_TRUST_INFORMATION: Name(Length+MaxLen+BufPtr) + SidPtr = 12 bytes
-			need := off + domainCount*12
-			if need > len(buf) {
+			// Checked before the allocation, not after: domainCount is whatever
+			// the server put on the wire.
+			if !fitsIn(domainCount, trustInfoSize, len(buf)-off) {
 				return nil, errors.New("lsarpc: truncated trust info array")
 			}
+			infos := make([]trustInfo, domainCount)
+
 			for i := 0; i < domainCount; i++ {
 				off += 2 // Name.Length
 				off += 2 // Name.MaximumLength
@@ -380,10 +496,10 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 					off += 4 // Offset
 					actualCount := int(le.Uint32(buf[off:]))
 					off += 4
-					strLen := actualCount * 2
-					if off+strLen > len(buf) {
+					if !fitsIn(actualCount, 2, len(buf)-off) {
 						return nil, errors.New("lsarpc: truncated domain name data")
 					}
+					strLen := actualCount * 2
 					domains[i] = decodeUTF16(buf[off : off+strLen])
 					off += strLen
 					off = roundup(off, 4)
@@ -396,11 +512,12 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 					}
 					subCount := int(le.Uint32(buf[off:]))
 					off += 4
-					sidSize := 8 + subCount*4
-					if off+sidSize > len(buf) {
+					// The fixed 8 bytes are taken off the budget before the
+					// sub-authorities are measured against what is left.
+					if off+8 > len(buf) || !fitsIn(subCount, 4, len(buf)-off-8) {
 						return nil, errors.New("lsarpc: truncated domain SID data")
 					}
-					off += sidSize
+					off += 8 + subCount*4
 				}
 			}
 		}
@@ -415,10 +532,12 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 	namesPtr := le.Uint32(buf[off:])
 	off += 4
 
-	results := make([]LookupResult, nameCount)
-
-	if namesPtr == 0 || nameCount == 0 {
-		return results, nil
+	// A null array pointer means no translations, whatever Entries claims. Sizing
+	// a result slice from a count with no array behind it would let a short
+	// response declare four billion entries and allocate on the way to finding
+	// out there are none.
+	if namesPtr == 0 || nameCount <= 0 {
+		return nil, nil
 	}
 
 	// Conformant array
@@ -432,13 +551,15 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 		namePtr     uint32
 		domainIndex int32
 	}
-	names := make([]translatedName, nameCount)
 
-	// LSAPR_TRANSLATED_NAME: Use(2) + Name.Len(2) + Name.MaxLen(2) + pad(2) + BufPtr(4) + DomainIdx(4) = 16
-	need := off + nameCount*16
-	if need > len(buf) {
+	// Both slices below are sized from nameCount, so the count has to be backed
+	// by the payload before either is allocated.
+	if !fitsIn(nameCount, translatedNameSize, len(buf)-off) {
 		return nil, errors.New("lsarpc: truncated translated name array")
 	}
+	results := make([]LookupResult, nameCount)
+	names := make([]translatedName, nameCount)
+
 	for i := 0; i < nameCount; i++ {
 		names[i].use = le.Uint16(buf[off:])
 		off += 2
@@ -463,10 +584,10 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 			off += 4 // Offset
 			actualCount := int(le.Uint32(buf[off:]))
 			off += 4
-			strLen := actualCount * 2
-			if off+strLen > len(buf) {
+			if !fitsIn(actualCount, 2, len(buf)-off) {
 				return nil, errors.New("lsarpc: truncated translated name data")
 			}
+			strLen := actualCount * 2
 			results[i].Name = decodeUTF16(buf[off : off+strLen])
 			off += strLen
 			off = roundup(off, 4)
@@ -501,7 +622,7 @@ func (r *LsarCloseRequest) Encode(b []byte) {
 	b[3] = RPC_PACKET_FLAG_FIRST | RPC_PACKET_FLAG_LAST
 	b[4] = 0x10
 	le.PutUint32(b[12:16], r.CallId)
-	le.PutUint16(b[20:22], 0)            // context id
+	le.PutUint16(b[20:22], 0)             // context id
 	le.PutUint16(b[22:24], OP_LSAR_CLOSE) // opnum
 
 	copy(b[24:44], r.PolicyHandle[:20])

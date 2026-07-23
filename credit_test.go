@@ -173,7 +173,10 @@ func TestSendRecvRespondedReportsNoResponse(t *testing.T) {
 
 	res, responded, err := fs.sendRecvResponded(SMB2_QUERY_INFO, new(QueryInfoRequest))
 
-	if !errors.Is(err, connErr) {
+	// Compared by identity on purpose: conn.sendWith returns conn.err verbatim,
+	// and errors.Is would raise this file's minimum Go version above the 1.12
+	// the module declares.
+	if err != connErr {
 		t.Fatalf("error = %v, want %v", err, connErr)
 	}
 

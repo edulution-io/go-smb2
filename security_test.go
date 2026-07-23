@@ -397,6 +397,45 @@ func TestWellKnownSidName(t *testing.T) {
 	}
 }
 
+// TestWellKnownSidNameSource pins the distinction LookupSidNames is built on: a
+// name from the static table is qualified and portable, a name derived from a
+// domain SID's RID is neither.
+func TestWellKnownSidNameSource(t *testing.T) {
+	tests := []struct {
+		name     string
+		rev      byte
+		auth     uint64
+		sub      []uint32
+		wantName string
+		wantSrc  SidNameSource
+	}{
+		{"static table entry", 1, 5, []uint32{18}, "NT AUTHORITY\\SYSTEM", SidNameWellKnown},
+		{"static table alias", 1, 5, []uint32{32, 544}, "BUILTIN\\Administrators", SidNameWellKnown},
+		{"domain RID guess", 1, 5, []uint32{21, 100, 200, 300, 513}, "Domain Users", SidNameDomainRID},
+		{"domain RID guess admin", 1, 5, []uint32{21, 100, 200, 300, 500}, "Administrator", SidNameDomainRID},
+		{"ordinary domain account", 1, 5, []uint32{21, 100, 200, 300, 1103}, "", SidNameNone},
+		{"non-domain unknown", 1, 5, []uint32{99}, "", SidNameNone},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sid := &Sid{
+				Revision:            tt.rev,
+				IdentifierAuthority: tt.auth,
+				SubAuthority:        tt.sub,
+			}
+			name, src := wellKnownSidName(sid)
+			if name != tt.wantName || src != tt.wantSrc {
+				t.Errorf("wellKnownSidName(%s) = (%q, %v), want (%q, %v)",
+					sid.String(), name, src, tt.wantName, tt.wantSrc)
+			}
+			if got := WellKnownSidName(sid); got != tt.wantName {
+				t.Errorf("WellKnownSidName(%s) = %q, want %q", sid.String(), got, tt.wantName)
+			}
+		})
+	}
+}
+
 func TestCollectSids(t *testing.T) {
 	ownerSID := buildSID(1, 5, 21, 100, 200, 300, 1000)
 	groupSID := buildSID(1, 5, 21, 100, 200, 300, 513)

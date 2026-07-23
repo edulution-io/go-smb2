@@ -313,6 +313,34 @@ func (r LsarLookupSidsResponseDecoder) CallId() uint32 {
 	return le.Uint32(r[12:16])
 }
 
+// ReturnValue returns the NTSTATUS the server appended to the stub data.
+//
+// The status is the stub's last field, so it is located from the end rather than
+// by walking the payload: everything before it is variable length, and a caller
+// that needs the status usually needs it precisely because the payload did not
+// parse the way it expected.
+//
+// Returns 0xFFFFFFFF when the PDU is too short to carry a status, so a truncated
+// response cannot be mistaken for STATUS_SUCCESS.
+func (r LsarLookupSidsResponseDecoder) ReturnValue() uint32 {
+	end := len(r)
+	if fragLen := int(le.Uint16(r[8:10])); fragLen >= 28 && fragLen <= len(r) {
+		end = fragLen
+	}
+	// An auth verifier, when present, is an 8-byte header plus AuthLength bytes.
+	if authLen := int(le.Uint16(r[10:12])); authLen > 0 {
+		end -= authLen + 8
+	}
+	// The smallest stub this call can produce is 20 bytes: a null ReferencedDomains
+	// pointer, an empty TranslatedNames (count + null pointer), MappedCount, and the
+	// status. Anything shorter is truncated, and reporting its last 4 bytes as the
+	// status would let a cut-off response read as STATUS_SUCCESS.
+	if end < 24+20 {
+		return 0xFFFFFFFF
+	}
+	return le.Uint32(r[end-4 : end])
+}
+
 // Results parses the referenced domains and translated names from the response.
 func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 	buf := []byte(r)

@@ -1,6 +1,9 @@
 package msrpc
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
 // buildLookupSidsResponse builds an RPC response PDU carrying stub bytes, with the
 // header fields ReturnValue reads.
@@ -106,4 +109,125 @@ func TestLsarLookupSidsResponseDecoderReturnValueShortBuffer(t *testing.T) {
 			t.Errorf("ReturnValue() on %d bytes = 0x%08X, want NoReturnValue", n, got)
 		}
 	}
+}
+
+// buildCountOnlyResponse builds a response whose ReferencedDomains list declares
+// domainCount entries but carries no array behind them.
+func buildCountOnlyResponse(domainCount uint32) []byte {
+	stub := make([]byte, 0, 20)
+	put := func(v uint32) {
+		b := make([]byte, 4)
+		le.PutUint32(b, v)
+		stub = append(stub, b...)
+	}
+	put(0x20000)     // ReferencedDomains pointer (non-null)
+	put(domainCount) // Entries
+	put(0x20004)     // Domains pointer (non-null)
+	put(domainCount) // MaxEntries
+	put(domainCount) // conformant MaxCount
+	return buildLookupSidsResponse(stub, uint16(24+len(stub)), 0)
+}
+
+// buildNamesCountOnlyResponse builds a response whose TranslatedNames declares
+// nameCount entries with no array behind them.
+func buildNamesCountOnlyResponse(nameCount uint32, namesPtr uint32) []byte {
+	stub := make([]byte, 0, 16)
+	put := func(v uint32) {
+		b := make([]byte, 4)
+		le.PutUint32(b, v)
+		stub = append(stub, b...)
+	}
+	put(0)         // ReferencedDomains pointer (null)
+	put(nameCount) // TranslatedNames.Entries
+	put(namesPtr)  // TranslatedNames pointer
+	put(nameCount) // conformant MaxCount
+	return buildLookupSidsResponse(stub, uint16(24+len(stub)), 0)
+}
+
+// Every count in a response is a server-declared uint32 that the payload does
+// not have to back. Results must reject a count the buffer cannot cover before
+// it sizes anything from it -- otherwise a tiny PDU declaring four billion
+// entries has the decoder reserve tens of gigabytes and die on the way to
+// discovering the response is truncated.
+func TestResultsRejectsUnbackedCountsWithoutAllocating(t *testing.T) {
+	// Large enough that a regression allocates hundreds of megabytes and trips
+	// the budget below, small enough not to kill the test host outright.
+	const declared = 20_000_000
+
+	tests := []struct {
+		name string
+		pdu  []byte
+	}{
+		{"referenced domain entries", buildCountOnlyResponse(declared)},
+		{"translated name entries", buildNamesCountOnlyResponse(declared, 0x30000)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if len(tt.pdu) > 128 {
+				t.Fatalf("fixture grew to %d bytes; it must stay tiny for this test to mean anything", len(tt.pdu))
+			}
+
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			results, err := LsarLookupSidsResponseDecoder(tt.pdu).Results()
+			runtime.ReadMemStats(&after)
+
+			if err == nil && len(results) != 0 {
+				t.Errorf("Results() = %d entries, want an error or nothing from a %d-byte response", len(results), len(tt.pdu))
+			}
+
+			const budget = 1 << 20
+			if grew := after.TotalAlloc - before.TotalAlloc; grew > budget {
+				t.Errorf("Results() allocated %d bytes from a %d-byte response, want under %d", grew, len(tt.pdu), budget)
+			}
+		})
+	}
+}
+
+// A count that overflows int when multiplied by its element size must not slip
+// past the bounds check. On a 32-bit build the product wraps; the check is done
+// in 64-bit arithmetic so that it fails there too.
+func TestResultsRejectsOverflowingCounts(t *testing.T) {
+	for _, count := range []uint32{0xFFFFFFFF, 0x80000000, 0x40000000, 0x20000000} {
+		for _, pdu := range [][]byte{
+			buildCountOnlyResponse(count),
+			buildNamesCountOnlyResponse(count, 0x30000),
+		} {
+			results, err := LsarLookupSidsResponseDecoder(pdu).Results()
+			if err == nil && len(results) != 0 {
+				t.Errorf("count 0x%08X: Results() = %d entries, want an error or nothing", count, len(results))
+			}
+		}
+	}
+}
+
+// A declared count with a null array pointer is not an array of empty results.
+func TestResultsNullNamesPointer(t *testing.T) {
+	results, err := LsarLookupSidsResponseDecoder(buildNamesCountOnlyResponse(0xFFFFFFFF, 0)).Results()
+	if err != nil {
+		t.Fatalf("Results() = %v, want no error", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("Results() = %d entries, want 0 for a null names pointer", len(results))
+	}
+}
+
+// Results and ReturnValue decode a PDU that a server controls end to end, so
+// neither may panic on any input. Both are bounded by the length of the buffer
+// they are given, which is what makes this target runnable at all: before the
+// counts were checked against the payload, a seed declaring four billion entries
+// exhausted memory rather than failing.
+func FuzzResults(f *testing.F) {
+	f.Add(buildCountOnlyResponse(3))
+	f.Add(buildNamesCountOnlyResponse(2, 0x30000))
+	f.Add(buildNamesCountOnlyResponse(2, 0))
+	f.Add(buildLookupSidsResponse(make([]byte, 40), 64, 0))
+	f.Add(buildAuthenticatedResponse(make([]byte, 20), 12, 16))
+
+	f.Fuzz(func(t *testing.T, b []byte) {
+		_, _ = LsarLookupSidsResponseDecoder(b).Results()
+		_ = LsarLookupSidsResponseDecoder(b).ReturnValue()
+	})
 }

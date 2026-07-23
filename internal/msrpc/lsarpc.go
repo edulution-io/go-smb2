@@ -311,6 +311,35 @@ type LookupResult struct {
 	Type   uint16 // SID_NAME_USE
 }
 
+// NDR element sizes, used to bound a server-declared count against the bytes
+// actually present before anything is sized from it.
+const (
+	// LSAPR_TRUST_INFORMATION: Name(Length+MaximumLength+BufPtr) + SidPtr.
+	trustInfoSize = 12
+
+	// LSAPR_TRANSLATED_NAME: Use + Name.Length + Name.MaximumLength + pad +
+	// BufPtr + DomainIndex.
+	translatedNameSize = 16
+)
+
+// fitsIn reports whether count elements of elemSize bytes each are present in
+// remaining bytes of buffer.
+//
+// Every count in a response is a server-declared uint32 that the payload does
+// not have to back, so it must be checked before it sizes an allocation: a
+// 44-byte PDU declaring four billion entries would otherwise have the decoder
+// reserve tens of gigabytes and die before the length check ever ran.
+//
+// The multiplication is done in 64-bit arithmetic because it overflows int on a
+// 32-bit build, where the product can wrap to a small or negative value and slip
+// past the very check it is meant to fail.
+func fitsIn(count, elemSize, remaining int) bool {
+	if count < 0 || remaining < 0 {
+		return false
+	}
+	return uint64(count)*uint64(elemSize) <= uint64(remaining)
+}
+
 // LsarLookupSidsResponseDecoder parses opnum 15 response.
 type LsarLookupSidsResponseDecoder []byte
 
@@ -410,13 +439,14 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 				namePtr uint32
 				sidPtr  uint32
 			}
-			infos := make([]trustInfo, domainCount)
 
-			// LSAPR_TRUST_INFORMATION: Name(Length+MaxLen+BufPtr) + SidPtr = 12 bytes
-			need := off + domainCount*12
-			if need > len(buf) {
+			// Checked before the allocation, not after: domainCount is whatever
+			// the server put on the wire.
+			if !fitsIn(domainCount, trustInfoSize, len(buf)-off) {
 				return nil, errors.New("lsarpc: truncated trust info array")
 			}
+			infos := make([]trustInfo, domainCount)
+
 			for i := 0; i < domainCount; i++ {
 				off += 2 // Name.Length
 				off += 2 // Name.MaximumLength
@@ -439,10 +469,10 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 					off += 4 // Offset
 					actualCount := int(le.Uint32(buf[off:]))
 					off += 4
-					strLen := actualCount * 2
-					if off+strLen > len(buf) {
+					if !fitsIn(actualCount, 2, len(buf)-off) {
 						return nil, errors.New("lsarpc: truncated domain name data")
 					}
+					strLen := actualCount * 2
 					domains[i] = decodeUTF16(buf[off : off+strLen])
 					off += strLen
 					off = roundup(off, 4)
@@ -455,11 +485,12 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 					}
 					subCount := int(le.Uint32(buf[off:]))
 					off += 4
-					sidSize := 8 + subCount*4
-					if off+sidSize > len(buf) {
+					// The fixed 8 bytes are taken off the budget before the
+					// sub-authorities are measured against what is left.
+					if off+8 > len(buf) || !fitsIn(subCount, 4, len(buf)-off-8) {
 						return nil, errors.New("lsarpc: truncated domain SID data")
 					}
-					off += sidSize
+					off += 8 + subCount*4
 				}
 			}
 		}
@@ -474,10 +505,12 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 	namesPtr := le.Uint32(buf[off:])
 	off += 4
 
-	results := make([]LookupResult, nameCount)
-
-	if namesPtr == 0 || nameCount == 0 {
-		return results, nil
+	// A null array pointer means no translations, whatever Entries claims. Sizing
+	// a result slice from a count with no array behind it would let a short
+	// response declare four billion entries and allocate on the way to finding
+	// out there are none.
+	if namesPtr == 0 || nameCount <= 0 {
+		return nil, nil
 	}
 
 	// Conformant array
@@ -491,13 +524,15 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 		namePtr     uint32
 		domainIndex int32
 	}
-	names := make([]translatedName, nameCount)
 
-	// LSAPR_TRANSLATED_NAME: Use(2) + Name.Len(2) + Name.MaxLen(2) + pad(2) + BufPtr(4) + DomainIdx(4) = 16
-	need := off + nameCount*16
-	if need > len(buf) {
+	// Both slices below are sized from nameCount, so the count has to be backed
+	// by the payload before either is allocated.
+	if !fitsIn(nameCount, translatedNameSize, len(buf)-off) {
 		return nil, errors.New("lsarpc: truncated translated name array")
 	}
+	results := make([]LookupResult, nameCount)
+	names := make([]translatedName, nameCount)
+
 	for i := 0; i < nameCount; i++ {
 		names[i].use = le.Uint16(buf[off:])
 		off += 2
@@ -522,10 +557,10 @@ func (r LsarLookupSidsResponseDecoder) Results() ([]LookupResult, error) {
 			off += 4 // Offset
 			actualCount := int(le.Uint32(buf[off:]))
 			off += 4
-			strLen := actualCount * 2
-			if off+strLen > len(buf) {
+			if !fitsIn(actualCount, 2, len(buf)-off) {
 				return nil, errors.New("lsarpc: truncated translated name data")
 			}
+			strLen := actualCount * 2
 			results[i].Name = decodeUTF16(buf[off : off+strLen])
 			off += strLen
 			off = roundup(off, 4)

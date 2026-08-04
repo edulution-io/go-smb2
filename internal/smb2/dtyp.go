@@ -74,6 +74,12 @@ type Sid struct {
 // one to a domain controller costs more than it looks: an LSARPC lookup answers
 // per request, not per SID, so Samba rejecting a single malformed SID with
 // STATUS_INVALID_SID discards the translations for every other SID in the batch.
+//
+// Requiring at least one sub-authority is deliberately stricter than Windows,
+// whose RtlValidSid checks the revision and the 15-element cap but accepts a
+// count of zero. That count is what makes a SID misread out of non-SID bytes
+// detectable, and no SID with no sub-authorities can identify a principal, so
+// the rule stays. Do not relax it to match RtlValidSid.
 func (sid *Sid) IsWellFormed() bool {
 	return sid != nil &&
 		sid.Revision == 1 &&
@@ -336,8 +342,10 @@ type AceDecoder []byte
 // this package can find one.
 const NoSidOffset = -1
 
-// SidOffset returns the offset of the SID within the ACE, or NoSidOffset when
-// the type's layout does not put one at a position this package can derive.
+// SidOffset returns the offset of a SID that is actually within the ACE, or
+// NoSidOffset when the type's layout does not put one at a position this package
+// can derive or the entry is too short to hold it. The result is always safe to
+// slice from.
 //
 // Three layouts share the ACE header. The standard one (MS-DTYP 2.4.4.2) puts
 // the SID right behind Mask, at offset 8, and the callback and label types keep
@@ -347,9 +355,11 @@ const NoSidOffset = -1
 // the low bytes of Flags as Revision and SubAuthorityCount -- a SID that decodes
 // without complaint and names nothing.
 //
-// The compound type 0x04 is reserved by MS-DTYP and holds two SIDs behind a
-// 4-byte discriminator; it gets NoSidOffset rather than a guess. So does any
-// type this package does not know, since an unknown layout gives no reason to
+// MS-DTYP lists the compound type 0x04 as reserved without giving a structure,
+// so there is nothing to derive an offset from and it gets NoSidOffset rather
+// than a guess. The other reserved types do get one: 0x03, 0x08, 0x0E and 0x10
+// are reserved for use but their layouts are documented. Any type this package
+// does not know is treated like 0x04, since an unknown layout gives no reason to
 // believe a SID sits at any particular place.
 func (a AceDecoder) SidOffset() int {
 	switch a.AceType() {
@@ -364,7 +374,7 @@ func (a AceDecoder) SidOffset() int {
 		SYSTEM_MANDATORY_LABEL_ACE_TYPE,
 		SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE,
 		SYSTEM_SCOPED_POLICY_ID_ACE_TYPE:
-		return 8
+		return sidOffsetWithin(a, 8)
 
 	case ACCESS_ALLOWED_OBJECT_ACE_TYPE,
 		ACCESS_DENIED_OBJECT_ACE_TYPE,
@@ -385,11 +395,21 @@ func (a AceDecoder) SidOffset() int {
 		if flags&ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
 			off += 16
 		}
-		return off
+		return sidOffsetWithin(a, off)
 
 	default:
 		return NoSidOffset
 	}
+}
+
+// sidOffsetWithin returns off only if a SID could begin there, so an entry whose
+// Flags claim GUIDs it is too short to hold reports no SID instead of an offset
+// past its own end.
+func sidOffsetWithin(a AceDecoder, off int) int {
+	if len(a) < off+8 { // 8 bytes is the shortest SID
+		return NoSidOffset
+	}
+	return off
 }
 
 func (a AceDecoder) IsInvalid() bool {
@@ -417,7 +437,7 @@ func (a AceDecoder) Mask() uint32 {
 
 func (a AceDecoder) Sid() SidDecoder {
 	off := a.SidOffset()
-	if off == NoSidOffset || len(a) < off+8 { // 8 bytes is the shortest SID
+	if off == NoSidOffset {
 		return nil
 	}
 	return SidDecoder(a[off:])

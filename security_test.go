@@ -2,6 +2,7 @@ package smb2
 
 import (
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"github.com/edulution-io/go-smb2/internal/msrpc"
@@ -23,6 +24,14 @@ func buildSID(revision byte, authority uint64, subAuthorities ...uint32) []byte 
 		binary.LittleEndian.PutUint32(b[off:off+4], sa)
 		off += 4
 	}
+	return b
+}
+
+// withSubAuthorityCount overwrites a binary SID's declared sub-authority count,
+// so a test can present a count the buffer does not match.
+func withSubAuthorityCount(sid []byte, count byte) []byte {
+	b := append([]byte{}, sid...)
+	b[1] = count
 	return b
 }
 
@@ -894,6 +903,196 @@ func TestCollectSids_ExcludesUndecodedACESids(t *testing.T) {
 	for _, s := range sids {
 		if !s.IsWellFormed() {
 			t.Errorf("CollectSids() returned malformed SID %q", s.String())
+		}
+	}
+}
+
+// An owner or group SID that cannot be read leaves the field nil. Failing the
+// parse over it would cost the caller the DACL as well, which is the opposite of
+// how an unreadable ACE SID is handled.
+func TestParseSecurityDescriptor_MalformedOwnerAndGroupAreNil(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		sid  []byte
+	}{
+		{"zero sub-authorities", buildSID(1, 5)},
+		{"revision 3", buildSID(3, 5, 21, 100, 200, 300, 1000)},
+		{"sub-authority count above 15", withSubAuthorityCount(buildSID(1, 5, 21, 100, 200, 300, 1000), 16)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			b := buildSecurityDescriptor(0, tt.sid, tt.sid, nil, nil)
+
+			result, err := parseSecurityDescriptor(b)
+			if err != nil {
+				t.Fatalf("parseSecurityDescriptor: %v", err)
+			}
+			if result.Owner != nil {
+				t.Errorf("Owner = %q, want nil", result.Owner.String())
+			}
+			if result.Group != nil {
+				t.Errorf("Group = %q, want nil", result.Group.String())
+			}
+			if sids := result.CollectSids(); len(sids) != 0 {
+				t.Errorf("CollectSids() = %v, want none", sids)
+			}
+		})
+	}
+}
+
+// A descriptor offset arrives as a uint32. Compared as a signed int it goes
+// negative on a 32-bit build from 0x80000000 up, passes the bounds check and
+// panics on the slice.
+func TestParseSecurityDescriptor_HighOffsetsRejected(t *testing.T) {
+	for _, field := range []struct {
+		name string
+		off  int
+	}{
+		{"owner", 4},
+		{"group", 8},
+		{"sacl", 12},
+		{"dacl", 16},
+	} {
+		for _, off := range []uint32{0x80000000, 0xFFFFFFFF} {
+			t.Run(fmt.Sprintf("%s/%#x", field.name, off), func(t *testing.T) {
+				b := make([]byte, 64)
+				b[0] = 1
+				// SE_SELF_RELATIVE plus both ACL-present bits, so the SACL and DACL
+				// offsets are reached at all.
+				binary.LittleEndian.PutUint16(b[2:4], 0x8000|SE_DACL_PRESENT|SE_SACL_PRESENT)
+				binary.LittleEndian.PutUint32(b[field.off:field.off+4], off)
+
+				if _, err := parseSecurityDescriptor(b); err == nil {
+					t.Fatalf("parseSecurityDescriptor accepted offset %#x", off)
+				}
+			})
+		}
+	}
+}
+
+// Every concrete ACE type carries an ACCESS_MASK, so an entry declaring fewer
+// than 8 bytes cannot be one. Admitting it produced a phantom ACCESS_DENIED with
+// Mask 0, which reads as denying nothing.
+func TestParseACL_RejectsUndersizedACE(t *testing.T) {
+	for _, aceSize := range []uint16{4, 5, 6, 7} {
+		t.Run(fmt.Sprintf("aceSize=%d", aceSize), func(t *testing.T) {
+			ace := make([]byte, aceSize)
+			ace[0] = ACCESS_DENIED_ACE_TYPE
+			binary.LittleEndian.PutUint16(ace[2:4], aceSize)
+
+			if _, err := parseACL(buildACL(2, ace)); err == nil {
+				t.Fatalf("parseACL accepted a %d-byte ACE", aceSize)
+			}
+		})
+	}
+}
+
+// An entry must not read a field it is too short to hold out of the ACE behind
+// it. An 8-byte ACE has no SID, and its Mask must not come from its neighbour.
+func TestParseACL_FieldsDoNotBleedBetweenACEs(t *testing.T) {
+	short := make([]byte, 8)
+	short[0] = ACCESS_DENIED_ACE_TYPE
+	binary.LittleEndian.PutUint16(short[2:4], 8)
+	// Mask deliberately left zero; the neighbour's is 0xDEADBEEF.
+
+	next := buildACE(ACCESS_ALLOWED_ACE_TYPE, 0, 0xDEADBEEF, buildSID(1, 5, 21, 100, 200, 300, 1000))
+
+	acl, err := parseACL(buildACL(2, short, next))
+	if err != nil {
+		t.Fatalf("parseACL: %v", err)
+	}
+	if len(acl.ACEs) != 2 {
+		t.Fatalf("expected 2 ACEs, got %d", len(acl.ACEs))
+	}
+	if acl.ACEs[0].Mask != 0 {
+		t.Errorf("ACEs[0].Mask = %#x, want 0 (bled in from the next ACE)", acl.ACEs[0].Mask)
+	}
+	if acl.ACEs[0].SIDValid {
+		t.Errorf("ACEs[0].SIDValid = true, want false")
+	}
+	if acl.ACEs[1].Mask != 0xDEADBEEF {
+		t.Errorf("ACEs[1].Mask = %#x, want 0xDEADBEEF", acl.ACEs[1].Mask)
+	}
+}
+
+// An object ACE whose Flags claim GUIDs the entry is too short to hold must not
+// report a SID offset past its own end.
+func TestParseACL_ObjectACEShorterThanItsFlagsClaim(t *testing.T) {
+	ace := make([]byte, 16)
+	ace[0] = ACCESS_ALLOWED_OBJECT_ACE_TYPE
+	binary.LittleEndian.PutUint16(ace[2:4], 16)
+	binary.LittleEndian.PutUint32(ace[8:12], ACE_OBJECT_TYPE_PRESENT|ACE_INHERITED_OBJECT_TYPE_PRESENT)
+
+	acl, err := parseACL(buildACL(2, ace))
+	if err != nil {
+		t.Fatalf("parseACL: %v", err)
+	}
+	if len(acl.ACEs) != 1 {
+		t.Fatalf("expected 1 ACE, got %d", len(acl.ACEs))
+	}
+	if acl.ACEs[0].SIDValid {
+		t.Errorf("SIDValid = true, want false (SID would start past the ACE)")
+	}
+}
+
+// A lying AceCount must not size the allocation on its own.
+func TestParseACL_AceCountDoesNotDriveAllocation(t *testing.T) {
+	ace := buildACE(ACCESS_ALLOWED_ACE_TYPE, 0, 0x1F01FF, buildSID(1, 5, 21, 100, 200, 300, 1000))
+	b := buildACL(2, ace)
+	binary.LittleEndian.PutUint16(b[4:6], 0xFFFF) // AceCount far beyond what fits
+
+	// The parse fails on the second entry; what matters is that it did not
+	// preallocate for 65535 ACEs on the way there.
+	acl, err := parseACL(b)
+	if err == nil {
+		t.Fatalf("parseACL accepted AceCount 0xFFFF, got %d ACEs", len(acl.ACEs))
+	}
+}
+
+func TestPartitionSids(t *testing.T) {
+	good := &Sid{Revision: 1, IdentifierAuthority: 5, SubAuthority: []uint32{21, 100, 200, 300, 1000}}
+	wellKnown := &Sid{Revision: 1, IdentifierAuthority: 5, SubAuthority: []uint32{18}}
+	noSubAuthority := &Sid{Revision: 1, IdentifierAuthority: 5}
+	badRevision := &Sid{Revision: 3, IdentifierAuthority: 5, SubAuthority: []uint32{21}}
+
+	unique, lookupable := partitionSids([]*Sid{good, wellKnown, noSubAuthority, badRevision, nil, good})
+
+	// Every non-nil input is answered for, the duplicate collapses.
+	if len(unique) != 4 {
+		t.Errorf("len(unique) = %d, want 4: %v", len(unique), unique)
+	}
+	// Only the two that can name something go on the wire.
+	if len(lookupable) != 2 {
+		t.Errorf("len(lookupable) = %d, want 2: %v", len(lookupable), lookupable)
+	}
+	for _, key := range []string{good.String(), wellKnown.String()} {
+		if _, ok := lookupable[key]; !ok {
+			t.Errorf("lookupable is missing %q", key)
+		}
+	}
+	for _, key := range []string{noSubAuthority.String(), badRevision.String()} {
+		if _, ok := lookupable[key]; ok {
+			t.Errorf("lookupable contains malformed %q", key)
+		}
+		if _, ok := unique[key]; !ok {
+			t.Errorf("unique is missing %q -- it must still be answered for", key)
+		}
+	}
+}
+
+func TestPartitionSidsAllMalformed(t *testing.T) {
+	unique, lookupable := partitionSids([]*Sid{{Revision: 1, IdentifierAuthority: 5}, nil})
+
+	if len(lookupable) != 0 {
+		t.Errorf("len(lookupable) = %d, want 0", len(lookupable))
+	}
+	// mergeSidNames still answers for the malformed one, with no name.
+	names := mergeSidNames(nil, unique)
+	if len(names) != 1 {
+		t.Fatalf("len(names) = %d, want 1", len(names))
+	}
+	for key, n := range names {
+		if n.Source != SidNameNone || n.Name != "" {
+			t.Errorf("names[%q] = %+v, want an empty SidNameNone entry", key, n)
 		}
 	}
 }

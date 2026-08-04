@@ -81,34 +81,38 @@ func parseSecurityDescriptor(b []byte) (*SecurityDescriptor, error) {
 		Control:  sd.Control(),
 	}
 
-	// Parse Owner SID
+	// Parse Owner SID. An offset the buffer cannot hold is a framing error and
+	// fails the parse, but a SID that is merely unreadable leaves Owner nil: the
+	// rest of the descriptor is still what the server said, and failing over one
+	// field would cost the caller the DACL as well.
+	//
+	// The four descriptor offsets are compared as uint64 because they arrive as
+	// uint32 from the server: on a 32-bit build int(off) is negative for anything
+	// from 0x80000000 up, which passes an int comparison and then panics on the
+	// slice.
 	if off := sd.OffsetOwner(); off != 0 {
-		if int(off) >= len(b) {
+		if uint64(off) >= uint64(len(b)) {
 			return nil, &InvalidResponseError{"owner SID offset out of bounds"}
 		}
-		sidDec := SidDecoder(b[off:])
-		if sidDec.IsInvalid() {
-			return nil, &InvalidResponseError{"invalid owner SID"}
+		if sidDec := SidDecoder(b[off:]); !sidDec.IsInvalid() {
+			result.Owner = sidDec.Decode()
 		}
-		result.Owner = sidDec.Decode()
 	}
 
 	// Parse Group SID
 	if off := sd.OffsetGroup(); off != 0 {
-		if int(off) >= len(b) {
+		if uint64(off) >= uint64(len(b)) {
 			return nil, &InvalidResponseError{"group SID offset out of bounds"}
 		}
-		sidDec := SidDecoder(b[off:])
-		if sidDec.IsInvalid() {
-			return nil, &InvalidResponseError{"invalid group SID"}
+		if sidDec := SidDecoder(b[off:]); !sidDec.IsInvalid() {
+			result.Group = sidDec.Decode()
 		}
-		result.Group = sidDec.Decode()
 	}
 
 	// Parse DACL
 	if sd.Control()&SE_DACL_PRESENT != 0 {
 		if off := sd.OffsetDacl(); off != 0 {
-			if int(off) >= len(b) {
+			if uint64(off) >= uint64(len(b)) {
 				return nil, &InvalidResponseError{"DACL offset out of bounds"}
 			}
 			acl, err := parseACL(b[off:])
@@ -122,7 +126,7 @@ func parseSecurityDescriptor(b []byte) (*SecurityDescriptor, error) {
 	// Parse SACL
 	if sd.Control()&SE_SACL_PRESENT != 0 {
 		if off := sd.OffsetSacl(); off != 0 {
-			if int(off) >= len(b) {
+			if uint64(off) >= uint64(len(b)) {
 				return nil, &InvalidResponseError{"SACL offset out of bounds"}
 			}
 			acl, err := parseACL(b[off:])
@@ -135,6 +139,12 @@ func parseSecurityDescriptor(b []byte) (*SecurityDescriptor, error) {
 
 	return result, nil
 }
+
+// minAceSize is the shortest an ACE can be. Every concrete type in MS-DTYP
+// 2.4.4.x carries an ACCESS_MASK behind the 4-byte header, so an entry that
+// declares less than 8 bytes cannot be one -- and admitting it would fabricate
+// a reading, an ACCESS_DENIED entry with Mask 0 that appears to deny nothing.
+const minAceSize = 8
 
 func parseACL(b []byte) (*ACL, error) {
 	hdr := AclHeaderDecoder(b)
@@ -149,10 +159,12 @@ func parseACL(b []byte) (*ACL, error) {
 	// Restrict parsing to the ACL's declared size.
 	b = b[:aclSize]
 
+	// AceCount is independent of AclSize, so it is capped at what the remaining
+	// bytes could actually describe before it sizes an allocation.
 	aceCount := int(hdr.AceCount())
 	acl := &ACL{
 		Revision: hdr.AclRevision(),
-		ACEs:     make([]ACE, 0, aceCount),
+		ACEs:     make([]ACE, 0, min(aceCount, (aclSize-8)/minAceSize)),
 	}
 
 	off := 8 // ACL header is 8 bytes
@@ -161,19 +173,14 @@ func parseACL(b []byte) (*ACL, error) {
 			return nil, &InvalidResponseError{"ACE header out of bounds"}
 		}
 
-		aceDec := AceDecoder(b[off:])
-		if aceDec.IsInvalid() {
-			return nil, &InvalidResponseError{"invalid ACE"}
-		}
-
-		aceSize := int(aceDec.AceSize())
-		if aceSize < 4 || off+aceSize > len(b) {
+		aceSize := int(AceDecoder(b[off:]).AceSize())
+		if aceSize < minAceSize || off+aceSize > len(b) {
 			return nil, &InvalidResponseError{"ACE data out of bounds"}
 		}
 
-		// Re-slice to the entry's own bounds so that a field the ACE is too short
-		// to hold reads as absent instead of reaching into the ACE behind it.
-		aceDec = AceDecoder(b[off : off+aceSize])
+		// Bounded to the entry's own size so that a field the ACE is too short to
+		// hold reads as absent instead of reaching into the ACE behind it.
+		aceDec := AceDecoder(b[off : off+aceSize])
 
 		ace := ACE{
 			Type:  aceDec.AceType(),
@@ -330,7 +337,10 @@ const (
 	// SidNameNone: nothing resolved the SID. Name is empty.
 	SidNameNone SidNameSource = iota
 
-	// SidNameLSARPC: the domain controller translated it. Name is DOMAIN\Name --
+	// SidNameLSARPC: the server asserted this translation. The pipe is opened on
+	// the server being browsed, which proxies to the DC, so the name is only as
+	// trustworthy as that server -- it means "the server said so", not "verified".
+	// Name is DOMAIN\Name --
 	// or the domain alone for a SID that names a domain, which has no account
 	// half -- and Type carries the SID_NAME_USE the DC reported. Neither half
 	// contains a backslash or a control character, so any separator in Name is the
@@ -365,24 +375,10 @@ type SidName struct {
 // translate -- deleted accounts, principals from a domain this DC does not trust
 // -- and failing the batch over them would discard the names that did resolve.
 // The error reports whether the LSARPC leg itself worked; Source reports what
-// each individual name is worth.
+// each individual name is worth. When no input SID is well-formed enough to ask
+// about, there is no LSARPC leg and the error is nil.
 func (s *Session) LookupSidNames(sids []*Sid) (map[string]SidName, error) {
-	// Deduplicate SIDs. A SID that cannot name anything is still answered for --
-	// the caller is promised an entry per input -- but is kept out of the LSARPC
-	// batch: the DC rejects the whole request over one malformed SID, so putting
-	// it on the wire would cost the translations of every other SID alongside it.
-	unique := make(map[string]*Sid, len(sids))
-	lookupable := make(map[string]*Sid, len(sids))
-	for _, sid := range sids {
-		if sid == nil {
-			continue
-		}
-		key := sid.String()
-		unique[key] = sid
-		if sid.IsWellFormed() {
-			lookupable[key] = sid
-		}
-	}
+	unique, lookupable := partitionSids(sids)
 
 	if len(lookupable) == 0 {
 		return mergeSidNames(nil, unique), nil
@@ -395,6 +391,29 @@ func (s *Session) LookupSidNames(sids []*Sid) (map[string]SidName, error) {
 	}
 
 	return mergeSidNames(rpcNames, unique), rpcErr
+}
+
+// partitionSids deduplicates the input by SID string and splits off the subset
+// worth sending to a domain controller.
+//
+// A SID that cannot name anything is still answered for -- the caller is
+// promised an entry per input -- but is kept out of the LSARPC batch: the DC
+// rejects the whole request over one malformed SID, so putting it on the wire
+// would cost the translations of every other SID alongside it.
+func partitionSids(sids []*Sid) (unique, lookupable map[string]*Sid) {
+	unique = make(map[string]*Sid, len(sids))
+	lookupable = make(map[string]*Sid, len(sids))
+	for _, sid := range sids {
+		if sid == nil {
+			continue
+		}
+		key := sid.String()
+		unique[key] = sid
+		if sid.IsWellFormed() {
+			lookupable[key] = sid
+		}
+	}
+	return unique, lookupable
 }
 
 // mergeSidNames lets the DC's translations win and fills every SID it did not

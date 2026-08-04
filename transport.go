@@ -19,8 +19,16 @@ type transport interface {
 }
 
 type directTCP struct {
-	sb   [4]byte
-	rb   [4]byte
+	sb [4]byte
+	rb [4]byte
+	// wv backs bufs, and bufs is a field rather than a local so that taking its
+	// address for WriteTo does not escape a fresh slice header per write.
+	//
+	// Holding the iovec on the struct makes Write single-writer: it is reached
+	// only from (*conn).runSender, which serializes every packet through one
+	// goroutine. A second concurrent writer would interleave into this vector.
+	wv   [2][]byte
+	bufs net.Buffers
 	conn net.Conn
 }
 
@@ -37,17 +45,19 @@ func (t *directTCP) Write(p []byte) (n int, err error) {
 
 	be.PutUint32(bs, uint32(len(p)))
 
-	_, err = t.conn.Write(bs)
+	// The length prefix and the packet go out as one writev, so a request costs
+	// one syscall rather than two and the prefix never leaves as its own tiny
+	// segment. On a transport that is not a TCP socket, WriteTo falls back to
+	// writing each buffer in turn.
+	// WriteTo consumes the vector, so rebuild it from wv on every write.
+	t.bufs = append(net.Buffers(t.wv[:0]), bs, p)
+
+	written, err := t.bufs.WriteTo(t.conn)
 	if err != nil {
 		return -1, err
 	}
 
-	n, err = t.conn.Write(p)
-	if err != nil {
-		return -1, err
-	}
-
-	return n + 4, nil
+	return int(written), nil
 }
 
 func (t *directTCP) ReadSize() (size int, err error) {

@@ -381,6 +381,10 @@ func (s *session) encrypt(pkt []byte) ([]byte, error) {
 func (s *session) decrypt(pkt []byte) ([]byte, error) {
 	t := TransformCodec(pkt)
 
+	// Reuniting the tag with the ciphertext it signs. This append stays within
+	// pkt's spare capacity when pkt came from newRecvBuffer, so the packet is
+	// decrypted in place; on a tightly sized buffer it still works, just with a
+	// copy.
 	c := append(t.EncryptedData(), t.Signature()...)
 
 	return s.decrypter.Open(

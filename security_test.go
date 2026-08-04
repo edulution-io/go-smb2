@@ -1096,3 +1096,77 @@ func TestPartitionSidsAllMalformed(t *testing.T) {
 		}
 	}
 }
+
+// A declared ACL size below the header is malformed. It also drove the ACE
+// capacity negative, which panicked in make rather than returning an error.
+func TestParseACL_RejectsUndersizedACL(t *testing.T) {
+	for _, aclSize := range []uint16{0, 1, 7} {
+		t.Run(fmt.Sprintf("aclSize=%d", aclSize), func(t *testing.T) {
+			b := make([]byte, 32)
+			b[0] = 2
+			binary.LittleEndian.PutUint16(b[2:4], aclSize)
+			binary.LittleEndian.PutUint16(b[4:6], 1)
+
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("parseACL panicked on AclSize %d: %v", aclSize, r)
+				}
+			}()
+			if _, err := parseACL(b); err == nil {
+				t.Fatalf("parseACL accepted AclSize %d", aclSize)
+			}
+		})
+	}
+}
+
+// 0x14 and 0x15 are documented types carrying a SID at offset 8, so they must
+// not fall through to the unknown-layout path.
+func TestParseACL_ProcessTrustLabelAndAccessFilter(t *testing.T) {
+	sid := buildSID(1, 5, 21, 100, 200, 300, 1000)
+
+	for _, tt := range []struct {
+		name    string
+		aceType byte
+	}{
+		{"SYSTEM_PROCESS_TRUST_LABEL", SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE},
+		{"SYSTEM_ACCESS_FILTER", SYSTEM_ACCESS_FILTER_ACE_TYPE},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			acl, err := parseACL(buildACL(2, buildACE(tt.aceType, 0, 0x1F01FF, sid)))
+			if err != nil {
+				t.Fatalf("parseACL: %v", err)
+			}
+			if !acl.ACEs[0].SIDValid {
+				t.Fatalf("SIDValid = false, want the SID decoded")
+			}
+			if got, want := acl.ACEs[0].SID.String(), "S-1-5-21-100-200-300-1000"; got != want {
+				t.Errorf("SID = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// A descriptor a caller assembled has no parser behind it to set SIDValid, so
+// CollectSids must judge the SID itself rather than the flag.
+func TestCollectSids_CallerConstructedDescriptor(t *testing.T) {
+	valid := Sid{Revision: 1, IdentifierAuthority: 5, SubAuthority: []uint32{21, 100, 200, 300, 1000}}
+	owner := Sid{Revision: 1, IdentifierAuthority: 5, SubAuthority: []uint32{18}}
+
+	sd := &SecurityDescriptor{
+		Owner: &owner,
+		DACL: &ACL{ACEs: []ACE{
+			{Type: ACCESS_ALLOWED_ACE_TYPE, Mask: 0x1F01FF, SID: valid},
+			{Type: ACCESS_DENIED_ACE_TYPE, Mask: 0x2}, // zero SID, never populated
+		}},
+	}
+
+	got := sd.CollectSids()
+	if len(got) != 2 {
+		t.Fatalf("CollectSids() = %v, want the owner and the one valid ACE SID", got)
+	}
+	for _, s := range got {
+		if !s.IsWellFormed() {
+			t.Errorf("CollectSids() returned malformed SID %q", s.String())
+		}
+	}
+}

@@ -139,15 +139,20 @@ func parseSecurityDescriptor(b []byte) (*SecurityDescriptor, error) {
 // fabricates a reading -- an ACCESS_DENIED with Mask 0 appears to deny nothing.
 const minAceSize = 8
 
+// aclHeaderSize is the fixed ACL header (MS-DTYP 2.4.5).
+const aclHeaderSize = 8
+
 func parseACL(b []byte) (*ACL, error) {
 	hdr := AclHeaderDecoder(b)
 	if hdr.IsInvalid() {
 		return nil, &InvalidResponseError{"invalid ACL header"}
 	}
 
+	// An ACL cannot be smaller than its own header, and the capacity below would
+	// go negative on a declared size of zero.
 	aclSize := int(hdr.AclSize())
-	if aclSize > len(b) {
-		return nil, &InvalidResponseError{"ACL size exceeds buffer"}
+	if aclSize < aclHeaderSize || aclSize > len(b) {
+		return nil, &InvalidResponseError{"invalid ACL size"}
 	}
 	// Restrict parsing to the ACL's declared size.
 	b = b[:aclSize]
@@ -157,10 +162,10 @@ func parseACL(b []byte) (*ACL, error) {
 	aceCount := int(hdr.AceCount())
 	acl := &ACL{
 		Revision: hdr.AclRevision(),
-		ACEs:     make([]ACE, 0, min(aceCount, (aclSize-8)/minAceSize)),
+		ACEs:     make([]ACE, 0, min(aceCount, (aclSize-aclHeaderSize)/minAceSize)),
 	}
 
-	off := 8 // ACL header is 8 bytes
+	off := aclHeaderSize
 	for i := 0; i < aceCount; i++ {
 		if off+4 > len(b) {
 			return nil, &InvalidResponseError{"ACE header out of bounds"}
@@ -642,12 +647,17 @@ func isSidNamePart(s string) bool {
 	return true
 }
 
-// CollectSids extracts all unique SIDs from a SecurityDescriptor.
+// CollectSids extracts all unique SIDs from a SecurityDescriptor, skipping any
+// that cannot name a principal.
+//
+// The filter is well-formedness rather than ACE.SIDValid: a descriptor a caller
+// assembled has no parser behind it to set that flag, and an entry the parser
+// could not read holds the zero SID, which is not well-formed either.
 func (sd *SecurityDescriptor) CollectSids() []*Sid {
 	seen := make(map[string]bool)
 	var result []*Sid
 	add := func(s *Sid) {
-		if s == nil {
+		if !s.IsWellFormed() {
 			return
 		}
 		key := s.String()
@@ -661,9 +671,7 @@ func (sd *SecurityDescriptor) CollectSids() []*Sid {
 			return
 		}
 		for i := range acl.ACEs {
-			if acl.ACEs[i].SIDValid {
-				add(&acl.ACEs[i].SID)
-			}
+			add(&acl.ACEs[i].SID)
 		}
 	}
 	add(sd.Owner)

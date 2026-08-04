@@ -34,9 +34,8 @@ type ACE struct {
 	Flags byte
 	Mask  uint32
 
-	// SID names the principal the entry applies to. It is meaningful only when
-	// SIDValid is true; the zero value renders as "S-0-0", which is a legal SID
-	// string and would otherwise be indistinguishable from one the server sent.
+	// SID is meaningful only when SIDValid is true; the zero value renders as
+	// "S-0-0", which is indistinguishable from a SID the server sent.
 	SID      Sid
 	SIDValid bool
 }
@@ -81,15 +80,10 @@ func parseSecurityDescriptor(b []byte) (*SecurityDescriptor, error) {
 		Control:  sd.Control(),
 	}
 
-	// Parse Owner SID. An offset the buffer cannot hold is a framing error and
-	// fails the parse, but a SID that is merely unreadable leaves Owner nil: the
-	// rest of the descriptor is still what the server said, and failing over one
-	// field would cost the caller the DACL as well.
-	//
-	// The four descriptor offsets are compared as uint64 because they arrive as
-	// uint32 from the server: on a 32-bit build int(off) is negative for anything
-	// from 0x80000000 up, which passes an int comparison and then panics on the
-	// slice.
+	// An offset the buffer cannot hold is a framing error; a SID that merely does
+	// not decode leaves the field nil, since failing here would cost the caller the
+	// DACL too. The four offsets are compared as uint64 because they arrive as
+	// uint32: on a 32-bit build int(off) goes negative above 0x7fffffff and passes.
 	if off := sd.OffsetOwner(); off != 0 {
 		if uint64(off) >= uint64(len(b)) {
 			return nil, &InvalidResponseError{"owner SID offset out of bounds"}
@@ -140,10 +134,9 @@ func parseSecurityDescriptor(b []byte) (*SecurityDescriptor, error) {
 	return result, nil
 }
 
-// minAceSize is the shortest an ACE can be. Every concrete type in MS-DTYP
-// 2.4.4.x carries an ACCESS_MASK behind the 4-byte header, so an entry that
-// declares less than 8 bytes cannot be one -- and admitting it would fabricate
-// a reading, an ACCESS_DENIED entry with Mask 0 that appears to deny nothing.
+// minAceSize is the shortest an ACE can be: every concrete type in MS-DTYP 2.4.4.x
+// carries an ACCESS_MASK behind the 4-byte header. Admitting a shorter entry
+// fabricates a reading -- an ACCESS_DENIED with Mask 0 appears to deny nothing.
 const minAceSize = 8
 
 func parseACL(b []byte) (*ACL, error) {
@@ -159,8 +152,8 @@ func parseACL(b []byte) (*ACL, error) {
 	// Restrict parsing to the ACL's declared size.
 	b = b[:aclSize]
 
-	// AceCount is independent of AclSize, so it is capped at what the remaining
-	// bytes could actually describe before it sizes an allocation.
+	// AceCount is independent of AclSize, so cap it at what the bytes could
+	// describe before it sizes an allocation.
 	aceCount := int(hdr.AceCount())
 	acl := &ACL{
 		Revision: hdr.AclRevision(),
@@ -178,8 +171,8 @@ func parseACL(b []byte) (*ACL, error) {
 			return nil, &InvalidResponseError{"ACE data out of bounds"}
 		}
 
-		// Bounded to the entry's own size so that a field the ACE is too short to
-		// hold reads as absent instead of reaching into the ACE behind it.
+		// Bounded to the entry's own size so a field it is too short to hold reads
+		// as absent instead of reaching into the ACE behind it.
 		aceDec := AceDecoder(b[off : off+aceSize])
 
 		ace := ACE{
@@ -188,10 +181,8 @@ func parseACL(b []byte) (*ACL, error) {
 			Mask:  aceDec.Mask(),
 		}
 
-		// Where the SID sits depends on the ACE type: the object types carry Flags
-		// and up to two GUIDs ahead of it. The entry is kept either way -- dropping
-		// an ACE would silently change what the ACL grants -- but an unreadable SID
-		// is reported as absent rather than as the zero value.
+		// The entry is kept even when its SID cannot be read: dropping it would
+		// silently change what the ACL grants.
 		if sidDec := aceDec.Sid(); sidDec != nil && !sidDec.IsInvalid() {
 			ace.SID = *sidDec.Decode()
 			ace.SIDValid = true
@@ -338,8 +329,7 @@ const (
 	SidNameNone SidNameSource = iota
 
 	// SidNameLSARPC: the server asserted this translation. The pipe is opened on
-	// the server being browsed, which proxies to the DC, so the name is only as
-	// trustworthy as that server -- it means "the server said so", not "verified".
+	// the server being browsed, so it means "the server said so", not "verified".
 	// Name is DOMAIN\Name --
 	// or the domain alone for a SID that names a domain, which has no account
 	// half -- and Type carries the SID_NAME_USE the DC reported. Neither half
@@ -393,13 +383,10 @@ func (s *Session) LookupSidNames(sids []*Sid) (map[string]SidName, error) {
 	return mergeSidNames(rpcNames, unique), rpcErr
 }
 
-// partitionSids deduplicates the input by SID string and splits off the subset
-// worth sending to a domain controller.
-//
-// A SID that cannot name anything is still answered for -- the caller is
-// promised an entry per input -- but is kept out of the LSARPC batch: the DC
-// rejects the whole request over one malformed SID, so putting it on the wire
-// would cost the translations of every other SID alongside it.
+// partitionSids deduplicates by SID string and splits off the subset worth sending
+// to a domain controller. A malformed SID is still answered for, but stays out of
+// the batch: the DC rejects the whole request over one, costing every other SID in
+// it its translation.
 func partitionSids(sids []*Sid) (unique, lookupable map[string]*Sid) {
 	unique = make(map[string]*Sid, len(sids))
 	lookupable = make(map[string]*Sid, len(sids))

@@ -498,6 +498,13 @@ func (conn *conn) runSender() {
 	}
 }
 
+// newRecvBuffer allocates the buffer one received packet is read into. The spare
+// capacity lets (*session).decrypt move an SMB3 transform packet's tag from offset
+// 4 to behind the ciphertext, where the AEAD wants it, without reallocating.
+func newRecvBuffer(n int) []byte {
+	return make([]byte, n, n+signatureSize)
+}
+
 func (conn *conn) runReciever() {
 	var err error
 
@@ -509,7 +516,7 @@ func (conn *conn) runReciever() {
 			goto exit
 		}
 
-		pkt := make([]byte, n)
+		pkt := newRecvBuffer(n)
 
 		_, e = conn.t.Read(pkt)
 		if e != nil {

@@ -20,6 +20,10 @@ import (
 
 var debug = os.Getenv("DEBUG") != ""
 
+// signatureSize is the length of an SMB2 packet signature and of an SMB3
+// transform header's AEAD tag.
+const signatureSize = 16
+
 var zero [16]byte
 
 var be = binary.BigEndian

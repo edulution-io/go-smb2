@@ -67,6 +67,20 @@ type Sid struct {
 	SubAuthority        []uint32
 }
 
+// IsWellFormed reports whether the SID satisfies the structural constraints of
+// MS-DTYP 2.4.2.2: revision 1 and between 1 and 15 sub-authorities.
+//
+// A SID that fails this is not merely unknown, it cannot name anything. Sending
+// one to a domain controller costs more than it looks: an LSARPC lookup answers
+// per request, not per SID, so Samba rejecting a single malformed SID with
+// STATUS_INVALID_SID discards the translations for every other SID in the batch.
+func (sid *Sid) IsWellFormed() bool {
+	return sid != nil &&
+		sid.Revision == 1 &&
+		len(sid.SubAuthority) >= 1 &&
+		len(sid.SubAuthority) <= 15
+}
+
 func (sid *Sid) String() string {
 	// Formatted into a stack buffer rather than joined from a []string: the join
 	// form allocated the slice plus one string per sub-authority, six allocations
@@ -109,16 +123,28 @@ func (sid *Sid) Encode(p []byte) {
 
 type SidDecoder []byte
 
+// IsInvalid reports whether the buffer does not hold a decodable SID.
+//
+// It enforces the structure MS-DTYP 2.4.2.2 fixes -- revision 1, 1 to 15
+// sub-authorities -- and not only that the buffer is long enough. A length-only
+// check accepts a zero-sub-authority SID read out of arbitrary bytes and hands
+// back something Decode() renders as a plausible "S-3-808530483", which then
+// travels to a domain controller and fails the lookup it takes part in.
 func (c SidDecoder) IsInvalid() bool {
 	if len(c) < 8 {
 		return true
 	}
 
-	if len(c) < 8+int(c.SubAuthorityCount())*4 {
+	if c.Revision() != 1 {
 		return true
 	}
 
-	return false
+	count := int(c.SubAuthorityCount())
+	if count < 1 || count > 15 {
+		return true
+	}
+
+	return len(c) < 8+count*4
 }
 
 func (c SidDecoder) Revision() uint8 {
@@ -180,11 +206,35 @@ const (
 )
 
 // ACE Types
+// ref: MS-DTYP 2.4.4.1
 const (
-	ACCESS_ALLOWED_ACE_TYPE = 0
-	ACCESS_DENIED_ACE_TYPE  = 1
-	SYSTEM_AUDIT_ACE_TYPE   = 2
-	SYSTEM_ALARM_ACE_TYPE   = 3
+	ACCESS_ALLOWED_ACE_TYPE                 = 0x00
+	ACCESS_DENIED_ACE_TYPE                  = 0x01
+	SYSTEM_AUDIT_ACE_TYPE                   = 0x02
+	SYSTEM_ALARM_ACE_TYPE                   = 0x03
+	ACCESS_ALLOWED_COMPOUND_ACE_TYPE        = 0x04
+	ACCESS_ALLOWED_OBJECT_ACE_TYPE          = 0x05
+	ACCESS_DENIED_OBJECT_ACE_TYPE           = 0x06
+	SYSTEM_AUDIT_OBJECT_ACE_TYPE            = 0x07
+	SYSTEM_ALARM_OBJECT_ACE_TYPE            = 0x08
+	ACCESS_ALLOWED_CALLBACK_ACE_TYPE        = 0x09
+	ACCESS_DENIED_CALLBACK_ACE_TYPE         = 0x0A
+	ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE = 0x0B
+	ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE  = 0x0C
+	SYSTEM_AUDIT_CALLBACK_ACE_TYPE          = 0x0D
+	SYSTEM_ALARM_CALLBACK_ACE_TYPE          = 0x0E
+	SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE   = 0x0F
+	SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE   = 0x10
+	SYSTEM_MANDATORY_LABEL_ACE_TYPE         = 0x11
+	SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE      = 0x12
+	SYSTEM_SCOPED_POLICY_ID_ACE_TYPE        = 0x13
+)
+
+// Object ACE Flags
+// ref: MS-DTYP 2.4.4.3
+const (
+	ACE_OBJECT_TYPE_PRESENT           = 0x00000001
+	ACE_INHERITED_OBJECT_TYPE_PRESENT = 0x00000002
 )
 
 // ACE Flags
@@ -278,7 +328,69 @@ func (a AclHeaderDecoder) AceCount() uint16 {
 //	2       2     AceSize
 //	4       4     Mask
 //	8       var   SID
+//
+// The SID does not sit at offset 8 for every type -- see SidOffset.
 type AceDecoder []byte
+
+// NoSidOffset is SidOffset's answer for an ACE whose layout places no SID where
+// this package can find one.
+const NoSidOffset = -1
+
+// SidOffset returns the offset of the SID within the ACE, or NoSidOffset when
+// the type's layout does not put one at a position this package can derive.
+//
+// Three layouts share the ACE header. The standard one (MS-DTYP 2.4.4.2) puts
+// the SID right behind Mask, at offset 8, and the callback and label types keep
+// it there and append their payload after it. The object types (2.4.4.3) insert
+// Flags and up to two 16-byte GUIDs first, each present only when Flags says so,
+// so their SID starts anywhere from 12 to 44. Reading offset 8 for those yields
+// the low bytes of Flags as Revision and SubAuthorityCount -- a SID that decodes
+// without complaint and names nothing.
+//
+// The compound type 0x04 is reserved by MS-DTYP and holds two SIDs behind a
+// 4-byte discriminator; it gets NoSidOffset rather than a guess. So does any
+// type this package does not know, since an unknown layout gives no reason to
+// believe a SID sits at any particular place.
+func (a AceDecoder) SidOffset() int {
+	switch a.AceType() {
+	case ACCESS_ALLOWED_ACE_TYPE,
+		ACCESS_DENIED_ACE_TYPE,
+		SYSTEM_AUDIT_ACE_TYPE,
+		SYSTEM_ALARM_ACE_TYPE,
+		ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+		ACCESS_DENIED_CALLBACK_ACE_TYPE,
+		SYSTEM_AUDIT_CALLBACK_ACE_TYPE,
+		SYSTEM_ALARM_CALLBACK_ACE_TYPE,
+		SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+		SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE,
+		SYSTEM_SCOPED_POLICY_ID_ACE_TYPE:
+		return 8
+
+	case ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+		ACCESS_DENIED_OBJECT_ACE_TYPE,
+		SYSTEM_AUDIT_OBJECT_ACE_TYPE,
+		SYSTEM_ALARM_OBJECT_ACE_TYPE,
+		ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE,
+		ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE,
+		SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE,
+		SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE:
+		if len(a) < 12 {
+			return NoSidOffset
+		}
+		off := 12
+		flags := le.Uint32(a[8:12])
+		if flags&ACE_OBJECT_TYPE_PRESENT != 0 {
+			off += 16
+		}
+		if flags&ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
+			off += 16
+		}
+		return off
+
+	default:
+		return NoSidOffset
+	}
+}
 
 func (a AceDecoder) IsInvalid() bool {
 	return len(a) < 4
@@ -304,8 +416,9 @@ func (a AceDecoder) Mask() uint32 {
 }
 
 func (a AceDecoder) Sid() SidDecoder {
-	if len(a) < 16 { // 8 bytes ACE header+mask + 8 bytes minimum SID
+	off := a.SidOffset()
+	if off == NoSidOffset || len(a) < off+8 { // 8 bytes is the shortest SID
 		return nil
 	}
-	return SidDecoder(a[8:])
+	return SidDecoder(a[off:])
 }

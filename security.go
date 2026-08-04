@@ -33,7 +33,12 @@ type ACE struct {
 	Type  byte
 	Flags byte
 	Mask  uint32
-	SID   Sid
+
+	// SID names the principal the entry applies to. It is meaningful only when
+	// SIDValid is true; the zero value renders as "S-0-0", which is a legal SID
+	// string and would otherwise be indistinguishable from one the server sent.
+	SID      Sid
+	SIDValid bool
 }
 
 // GetSecurityDescriptor retrieves the NT security descriptor for the file,
@@ -166,18 +171,23 @@ func parseACL(b []byte) (*ACL, error) {
 			return nil, &InvalidResponseError{"ACE data out of bounds"}
 		}
 
+		// Re-slice to the entry's own bounds so that a field the ACE is too short
+		// to hold reads as absent instead of reaching into the ACE behind it.
+		aceDec = AceDecoder(b[off : off+aceSize])
+
 		ace := ACE{
 			Type:  aceDec.AceType(),
 			Flags: aceDec.AceFlags(),
 			Mask:  aceDec.Mask(),
 		}
 
-		// Parse SID for standard ACE types (Mask at offset 4, SID at offset 8)
-		if aceSize > 8 {
-			sidDec := SidDecoder(b[off+8 : off+aceSize])
-			if !sidDec.IsInvalid() {
-				ace.SID = *sidDec.Decode()
-			}
+		// Where the SID sits depends on the ACE type: the object types carry Flags
+		// and up to two GUIDs ahead of it. The entry is kept either way -- dropping
+		// an ACE would silently change what the ACL grants -- but an unreadable SID
+		// is reported as absent rather than as the zero value.
+		if sidDec := aceDec.Sid(); sidDec != nil && !sidDec.IsInvalid() {
+			ace.SID = *sidDec.Decode()
+			ace.SIDValid = true
 		}
 
 		acl.ACEs = append(acl.ACEs, ace)
@@ -357,14 +367,29 @@ type SidName struct {
 // The error reports whether the LSARPC leg itself worked; Source reports what
 // each individual name is worth.
 func (s *Session) LookupSidNames(sids []*Sid) (map[string]SidName, error) {
-	// Deduplicate SIDs
+	// Deduplicate SIDs. A SID that cannot name anything is still answered for --
+	// the caller is promised an entry per input -- but is kept out of the LSARPC
+	// batch: the DC rejects the whole request over one malformed SID, so putting
+	// it on the wire would cost the translations of every other SID alongside it.
 	unique := make(map[string]*Sid, len(sids))
+	lookupable := make(map[string]*Sid, len(sids))
 	for _, sid := range sids {
-		unique[sid.String()] = sid
+		if sid == nil {
+			continue
+		}
+		key := sid.String()
+		unique[key] = sid
+		if sid.IsWellFormed() {
+			lookupable[key] = sid
+		}
+	}
+
+	if len(lookupable) == 0 {
+		return mergeSidNames(nil, unique), nil
 	}
 
 	// Try LSARPC
-	rpcNames, rpcErr := s.lookupSidsRPC(unique)
+	rpcNames, rpcErr := s.lookupSidsRPC(lookupable)
 	if rpcErr != nil {
 		rpcNames = nil
 	}
@@ -625,18 +650,20 @@ func (sd *SecurityDescriptor) CollectSids() []*Sid {
 			result = append(result, s)
 		}
 	}
+	addACEs := func(acl *ACL) {
+		if acl == nil {
+			return
+		}
+		for i := range acl.ACEs {
+			if acl.ACEs[i].SIDValid {
+				add(&acl.ACEs[i].SID)
+			}
+		}
+	}
 	add(sd.Owner)
 	add(sd.Group)
-	if sd.DACL != nil {
-		for i := range sd.DACL.ACEs {
-			add(&sd.DACL.ACEs[i].SID)
-		}
-	}
-	if sd.SACL != nil {
-		for i := range sd.SACL.ACEs {
-			add(&sd.SACL.ACEs[i].SID)
-		}
-	}
+	addACEs(sd.DACL)
+	addACEs(sd.SACL)
 	return result
 }
 

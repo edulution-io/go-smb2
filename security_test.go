@@ -2,6 +2,7 @@ package smb2
 
 import (
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"github.com/edulution-io/go-smb2/internal/msrpc"
@@ -23,6 +24,14 @@ func buildSID(revision byte, authority uint64, subAuthorities ...uint32) []byte 
 		binary.LittleEndian.PutUint32(b[off:off+4], sa)
 		off += 4
 	}
+	return b
+}
+
+// withSubAuthorityCount overwrites a binary SID's declared sub-authority count,
+// so a test can present a count the buffer does not match.
+func withSubAuthorityCount(sid []byte, count byte) []byte {
+	b := append([]byte{}, sid...)
+	b[1] = count
 	return b
 }
 
@@ -694,6 +703,470 @@ func TestNamedSids(t *testing.T) {
 	for key, w := range want {
 		if got[key] != w {
 			t.Errorf("namedSids()[%q] = %q, want %q", key, got[key], w)
+		}
+	}
+}
+
+// buildObjectACE constructs a binary object ACE (MS-DTYP 2.4.4.3): header, mask,
+// Flags, then each GUID that Flags declares present, then the SID.
+func buildObjectACE(aceType, aceFlags byte, mask, objectFlags uint32, sid []byte) []byte {
+	aceSize := 12 + len(sid)
+	if objectFlags&ACE_OBJECT_TYPE_PRESENT != 0 {
+		aceSize += 16
+	}
+	if objectFlags&ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
+		aceSize += 16
+	}
+
+	b := make([]byte, aceSize)
+	b[0] = aceType
+	b[1] = aceFlags
+	binary.LittleEndian.PutUint16(b[2:4], uint16(aceSize))
+	binary.LittleEndian.PutUint32(b[4:8], mask)
+	binary.LittleEndian.PutUint32(b[8:12], objectFlags)
+
+	off := 12
+	if objectFlags&ACE_OBJECT_TYPE_PRESENT != 0 {
+		copy(b[off:off+16], []byte("OBJECTTYPEGUID--"))
+		off += 16
+	}
+	if objectFlags&ACE_INHERITED_OBJECT_TYPE_PRESENT != 0 {
+		copy(b[off:off+16], []byte("INHERITEDGUID---"))
+		off += 16
+	}
+	copy(b[off:], sid)
+	return b
+}
+
+// An object ACE puts Flags and up to two GUIDs between Mask and the SID. Reading
+// the SID at the standard offset 8 lands on Flags and yields a SID with no
+// sub-authorities, which a DC rejects for the whole lookup batch it appears in.
+func TestParseACL_ObjectACESidOffset(t *testing.T) {
+	sid := buildSID(1, 5, 21, 100, 200, 300, 1000)
+	const want = "S-1-5-21-100-200-300-1000"
+
+	objectTypes := []struct {
+		name    string
+		aceType byte
+	}{
+		{"ACCESS_ALLOWED_OBJECT", ACCESS_ALLOWED_OBJECT_ACE_TYPE},
+		{"ACCESS_DENIED_OBJECT", ACCESS_DENIED_OBJECT_ACE_TYPE},
+		{"SYSTEM_AUDIT_OBJECT", SYSTEM_AUDIT_OBJECT_ACE_TYPE},
+		{"SYSTEM_ALARM_OBJECT", SYSTEM_ALARM_OBJECT_ACE_TYPE},
+		{"ACCESS_ALLOWED_CALLBACK_OBJECT", ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE},
+		{"ACCESS_DENIED_CALLBACK_OBJECT", ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE},
+		{"SYSTEM_AUDIT_CALLBACK_OBJECT", SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE},
+		{"SYSTEM_ALARM_CALLBACK_OBJECT", SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE},
+	}
+	flagCases := []struct {
+		name  string
+		flags uint32
+	}{
+		{"both GUIDs", ACE_OBJECT_TYPE_PRESENT | ACE_INHERITED_OBJECT_TYPE_PRESENT},
+		{"object type only", ACE_OBJECT_TYPE_PRESENT},
+		{"inherited type only", ACE_INHERITED_OBJECT_TYPE_PRESENT},
+		{"no GUID", 0},
+	}
+
+	for _, ot := range objectTypes {
+		for _, fc := range flagCases {
+			t.Run(ot.name+"/"+fc.name, func(t *testing.T) {
+				ace := buildObjectACE(ot.aceType, 0, 0x1F01FF, fc.flags, sid)
+				acl, err := parseACL(buildACL(2, ace))
+				if err != nil {
+					t.Fatalf("parseACL: %v", err)
+				}
+				if len(acl.ACEs) != 1 {
+					t.Fatalf("expected 1 ACE, got %d", len(acl.ACEs))
+				}
+				if !acl.ACEs[0].SIDValid {
+					t.Fatalf("SIDValid = false, want the SID decoded")
+				}
+				if got := acl.ACEs[0].SID.String(); got != want {
+					t.Errorf("SID = %q, want %q", got, want)
+				}
+				if acl.ACEs[0].Type != ot.aceType {
+					t.Errorf("Type = %#x, want %#x", acl.ACEs[0].Type, ot.aceType)
+				}
+				if acl.ACEs[0].Mask != 0x1F01FF {
+					t.Errorf("Mask = %#x, want 0x1F01FF", acl.ACEs[0].Mask)
+				}
+			})
+		}
+	}
+}
+
+// Callback and label ACEs keep the SID at offset 8 and append their payload
+// behind it, so the trailing bytes must not disturb the decode.
+func TestParseACL_ACEsWithTrailingPayload(t *testing.T) {
+	sid := buildSID(1, 5, 21, 100, 200, 300, 1000)
+
+	for _, tt := range []struct {
+		name    string
+		aceType byte
+	}{
+		{"ACCESS_ALLOWED_CALLBACK", ACCESS_ALLOWED_CALLBACK_ACE_TYPE},
+		{"ACCESS_DENIED_CALLBACK", ACCESS_DENIED_CALLBACK_ACE_TYPE},
+		{"SYSTEM_AUDIT_CALLBACK", SYSTEM_AUDIT_CALLBACK_ACE_TYPE},
+		{"SYSTEM_RESOURCE_ATTRIBUTE", SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Conditional expression / attribute blob trailing the SID.
+			payload := []byte("artx\x00\x00\x00\x00condition-blob")
+			ace := buildACE(tt.aceType, 0, 0x1F01FF, append(append([]byte{}, sid...), payload...))
+
+			acl, err := parseACL(buildACL(2, ace))
+			if err != nil {
+				t.Fatalf("parseACL: %v", err)
+			}
+			if !acl.ACEs[0].SIDValid {
+				t.Fatalf("SIDValid = false, want the SID decoded")
+			}
+			if got, want := acl.ACEs[0].SID.String(), "S-1-5-21-100-200-300-1000"; got != want {
+				t.Errorf("SID = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// A mandatory label carries an ordinary SID at offset 8.
+func TestParseACL_MandatoryLabel(t *testing.T) {
+	ace := buildACE(SYSTEM_MANDATORY_LABEL_ACE_TYPE, 0, 0x1, buildSID(1, 16, 8192))
+
+	acl, err := parseACL(buildACL(2, ace))
+	if err != nil {
+		t.Fatalf("parseACL: %v", err)
+	}
+	if !acl.ACEs[0].SIDValid {
+		t.Fatalf("SIDValid = false, want the SID decoded")
+	}
+	if got, want := acl.ACEs[0].SID.String(), "S-1-16-8192"; got != want {
+		t.Errorf("SID = %q, want %q", got, want)
+	}
+}
+
+// A layout this package cannot read must not produce a SID out of whatever bytes
+// sit at offset 8. The entry itself is kept: dropping it would change what the
+// ACL says it grants.
+func TestParseACL_UnreadableLayoutYieldsNoSid(t *testing.T) {
+	sid := buildSID(1, 5, 21, 100, 200, 300, 1000)
+
+	for _, tt := range []struct {
+		name    string
+		ace     []byte
+		aceType byte
+	}{
+		{"compound ACE", buildACE(ACCESS_ALLOWED_COMPOUND_ACE_TYPE, 0, 0x1F01FF, sid), ACCESS_ALLOWED_COMPOUND_ACE_TYPE},
+		{"unknown type", buildACE(0x42, 0, 0x1F01FF, sid), 0x42},
+		{"truncated SID", buildACE(ACCESS_ALLOWED_ACE_TYPE, 0, 0x1F01FF, sid[:12]), ACCESS_ALLOWED_ACE_TYPE},
+		{"no SID at all", buildACE(ACCESS_ALLOWED_ACE_TYPE, 0, 0x1F01FF, nil), ACCESS_ALLOWED_ACE_TYPE},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			acl, err := parseACL(buildACL(2, tt.ace))
+			if err != nil {
+				t.Fatalf("parseACL: %v", err)
+			}
+			if len(acl.ACEs) != 1 {
+				t.Fatalf("expected the ACE to be kept, got %d ACEs", len(acl.ACEs))
+			}
+			if acl.ACEs[0].SIDValid {
+				t.Errorf("SIDValid = true, want the SID reported as absent (got %q)", acl.ACEs[0].SID.String())
+			}
+			if acl.ACEs[0].Type != tt.aceType {
+				t.Errorf("Type = %#x, want %#x", acl.ACEs[0].Type, tt.aceType)
+			}
+			if acl.ACEs[0].Mask != 0x1F01FF {
+				t.Errorf("Mask = %#x, want 0x1F01FF", acl.ACEs[0].Mask)
+			}
+		})
+	}
+}
+
+// An ACE whose SID did not decode must stay out of CollectSids: one malformed
+// SID fails the entire LSARPC batch it travels in.
+func TestCollectSids_ExcludesUndecodedACESids(t *testing.T) {
+	good := buildACE(ACCESS_ALLOWED_ACE_TYPE, 0, 0x1F01FF, buildSID(1, 5, 21, 100, 200, 300, 1000))
+	unreadable := buildACE(0x42, 0, 0x1F01FF, buildSID(1, 5, 21, 100, 200, 300, 1001))
+
+	acl, err := parseACL(buildACL(2, good, unreadable))
+	if err != nil {
+		t.Fatalf("parseACL: %v", err)
+	}
+
+	sids := (&SecurityDescriptor{DACL: acl}).CollectSids()
+	if len(sids) != 1 {
+		t.Fatalf("CollectSids() returned %d SIDs, want 1", len(sids))
+	}
+	if got, want := sids[0].String(), "S-1-5-21-100-200-300-1000"; got != want {
+		t.Errorf("CollectSids()[0] = %q, want %q", got, want)
+	}
+	for _, s := range sids {
+		if !s.IsWellFormed() {
+			t.Errorf("CollectSids() returned malformed SID %q", s.String())
+		}
+	}
+}
+
+// An owner or group SID that cannot be read leaves the field nil. Failing the
+// parse over it would cost the caller the DACL as well, which is the opposite of
+// how an unreadable ACE SID is handled.
+func TestParseSecurityDescriptor_MalformedOwnerAndGroupAreNil(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		sid  []byte
+	}{
+		{"zero sub-authorities", buildSID(1, 5)},
+		{"revision 3", buildSID(3, 5, 21, 100, 200, 300, 1000)},
+		{"sub-authority count above 15", withSubAuthorityCount(buildSID(1, 5, 21, 100, 200, 300, 1000), 16)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			b := buildSecurityDescriptor(0, tt.sid, tt.sid, nil, nil)
+
+			result, err := parseSecurityDescriptor(b)
+			if err != nil {
+				t.Fatalf("parseSecurityDescriptor: %v", err)
+			}
+			if result.Owner != nil {
+				t.Errorf("Owner = %q, want nil", result.Owner.String())
+			}
+			if result.Group != nil {
+				t.Errorf("Group = %q, want nil", result.Group.String())
+			}
+			if sids := result.CollectSids(); len(sids) != 0 {
+				t.Errorf("CollectSids() = %v, want none", sids)
+			}
+		})
+	}
+}
+
+// A descriptor offset arrives as a uint32. Compared as a signed int it goes
+// negative on a 32-bit build from 0x80000000 up, passes the bounds check and
+// panics on the slice.
+func TestParseSecurityDescriptor_HighOffsetsRejected(t *testing.T) {
+	for _, field := range []struct {
+		name string
+		off  int
+	}{
+		{"owner", 4},
+		{"group", 8},
+		{"sacl", 12},
+		{"dacl", 16},
+	} {
+		for _, off := range []uint32{0x80000000, 0xFFFFFFFF} {
+			t.Run(fmt.Sprintf("%s/%#x", field.name, off), func(t *testing.T) {
+				b := make([]byte, 64)
+				b[0] = 1
+				// SE_SELF_RELATIVE plus both ACL-present bits, so the SACL and DACL
+				// offsets are reached at all.
+				binary.LittleEndian.PutUint16(b[2:4], 0x8000|SE_DACL_PRESENT|SE_SACL_PRESENT)
+				binary.LittleEndian.PutUint32(b[field.off:field.off+4], off)
+
+				if _, err := parseSecurityDescriptor(b); err == nil {
+					t.Fatalf("parseSecurityDescriptor accepted offset %#x", off)
+				}
+			})
+		}
+	}
+}
+
+// Every concrete ACE type carries an ACCESS_MASK, so an entry declaring fewer
+// than 8 bytes cannot be one. Admitting it produced a phantom ACCESS_DENIED with
+// Mask 0, which reads as denying nothing.
+func TestParseACL_RejectsUndersizedACE(t *testing.T) {
+	for _, aceSize := range []uint16{4, 5, 6, 7} {
+		t.Run(fmt.Sprintf("aceSize=%d", aceSize), func(t *testing.T) {
+			ace := make([]byte, aceSize)
+			ace[0] = ACCESS_DENIED_ACE_TYPE
+			binary.LittleEndian.PutUint16(ace[2:4], aceSize)
+
+			if _, err := parseACL(buildACL(2, ace)); err == nil {
+				t.Fatalf("parseACL accepted a %d-byte ACE", aceSize)
+			}
+		})
+	}
+}
+
+// An entry must not read a field it is too short to hold out of the ACE behind
+// it. An 8-byte ACE has no SID, and its Mask must not come from its neighbour.
+func TestParseACL_FieldsDoNotBleedBetweenACEs(t *testing.T) {
+	short := make([]byte, 8)
+	short[0] = ACCESS_DENIED_ACE_TYPE
+	binary.LittleEndian.PutUint16(short[2:4], 8)
+	// Mask deliberately left zero; the neighbour's is 0xDEADBEEF.
+
+	next := buildACE(ACCESS_ALLOWED_ACE_TYPE, 0, 0xDEADBEEF, buildSID(1, 5, 21, 100, 200, 300, 1000))
+
+	acl, err := parseACL(buildACL(2, short, next))
+	if err != nil {
+		t.Fatalf("parseACL: %v", err)
+	}
+	if len(acl.ACEs) != 2 {
+		t.Fatalf("expected 2 ACEs, got %d", len(acl.ACEs))
+	}
+	if acl.ACEs[0].Mask != 0 {
+		t.Errorf("ACEs[0].Mask = %#x, want 0 (bled in from the next ACE)", acl.ACEs[0].Mask)
+	}
+	if acl.ACEs[0].SIDValid {
+		t.Errorf("ACEs[0].SIDValid = true, want false")
+	}
+	if acl.ACEs[1].Mask != 0xDEADBEEF {
+		t.Errorf("ACEs[1].Mask = %#x, want 0xDEADBEEF", acl.ACEs[1].Mask)
+	}
+}
+
+// An object ACE whose Flags claim GUIDs the entry is too short to hold must not
+// report a SID offset past its own end.
+func TestParseACL_ObjectACEShorterThanItsFlagsClaim(t *testing.T) {
+	ace := make([]byte, 16)
+	ace[0] = ACCESS_ALLOWED_OBJECT_ACE_TYPE
+	binary.LittleEndian.PutUint16(ace[2:4], 16)
+	binary.LittleEndian.PutUint32(ace[8:12], ACE_OBJECT_TYPE_PRESENT|ACE_INHERITED_OBJECT_TYPE_PRESENT)
+
+	acl, err := parseACL(buildACL(2, ace))
+	if err != nil {
+		t.Fatalf("parseACL: %v", err)
+	}
+	if len(acl.ACEs) != 1 {
+		t.Fatalf("expected 1 ACE, got %d", len(acl.ACEs))
+	}
+	if acl.ACEs[0].SIDValid {
+		t.Errorf("SIDValid = true, want false (SID would start past the ACE)")
+	}
+}
+
+// A lying AceCount must not size the allocation on its own.
+func TestParseACL_AceCountDoesNotDriveAllocation(t *testing.T) {
+	ace := buildACE(ACCESS_ALLOWED_ACE_TYPE, 0, 0x1F01FF, buildSID(1, 5, 21, 100, 200, 300, 1000))
+	b := buildACL(2, ace)
+	binary.LittleEndian.PutUint16(b[4:6], 0xFFFF) // AceCount far beyond what fits
+
+	// The parse fails on the second entry; what matters is that it did not
+	// preallocate for 65535 ACEs on the way there.
+	acl, err := parseACL(b)
+	if err == nil {
+		t.Fatalf("parseACL accepted AceCount 0xFFFF, got %d ACEs", len(acl.ACEs))
+	}
+}
+
+func TestPartitionSids(t *testing.T) {
+	good := &Sid{Revision: 1, IdentifierAuthority: 5, SubAuthority: []uint32{21, 100, 200, 300, 1000}}
+	wellKnown := &Sid{Revision: 1, IdentifierAuthority: 5, SubAuthority: []uint32{18}}
+	noSubAuthority := &Sid{Revision: 1, IdentifierAuthority: 5}
+	badRevision := &Sid{Revision: 3, IdentifierAuthority: 5, SubAuthority: []uint32{21}}
+
+	unique, lookupable := partitionSids([]*Sid{good, wellKnown, noSubAuthority, badRevision, nil, good})
+
+	// Every non-nil input is answered for, the duplicate collapses.
+	if len(unique) != 4 {
+		t.Errorf("len(unique) = %d, want 4: %v", len(unique), unique)
+	}
+	// Only the two that can name something go on the wire.
+	if len(lookupable) != 2 {
+		t.Errorf("len(lookupable) = %d, want 2: %v", len(lookupable), lookupable)
+	}
+	for _, key := range []string{good.String(), wellKnown.String()} {
+		if _, ok := lookupable[key]; !ok {
+			t.Errorf("lookupable is missing %q", key)
+		}
+	}
+	for _, key := range []string{noSubAuthority.String(), badRevision.String()} {
+		if _, ok := lookupable[key]; ok {
+			t.Errorf("lookupable contains malformed %q", key)
+		}
+		if _, ok := unique[key]; !ok {
+			t.Errorf("unique is missing %q -- it must still be answered for", key)
+		}
+	}
+}
+
+func TestPartitionSidsAllMalformed(t *testing.T) {
+	unique, lookupable := partitionSids([]*Sid{{Revision: 1, IdentifierAuthority: 5}, nil})
+
+	if len(lookupable) != 0 {
+		t.Errorf("len(lookupable) = %d, want 0", len(lookupable))
+	}
+	// mergeSidNames still answers for the malformed one, with no name.
+	names := mergeSidNames(nil, unique)
+	if len(names) != 1 {
+		t.Fatalf("len(names) = %d, want 1", len(names))
+	}
+	for key, n := range names {
+		if n.Source != SidNameNone || n.Name != "" {
+			t.Errorf("names[%q] = %+v, want an empty SidNameNone entry", key, n)
+		}
+	}
+}
+
+// A declared ACL size below the header is malformed. It also drove the ACE
+// capacity negative, which panicked in make rather than returning an error.
+func TestParseACL_RejectsUndersizedACL(t *testing.T) {
+	for _, aclSize := range []uint16{0, 1, 7} {
+		t.Run(fmt.Sprintf("aclSize=%d", aclSize), func(t *testing.T) {
+			b := make([]byte, 32)
+			b[0] = 2
+			binary.LittleEndian.PutUint16(b[2:4], aclSize)
+			binary.LittleEndian.PutUint16(b[4:6], 1)
+
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("parseACL panicked on AclSize %d: %v", aclSize, r)
+				}
+			}()
+			if _, err := parseACL(b); err == nil {
+				t.Fatalf("parseACL accepted AclSize %d", aclSize)
+			}
+		})
+	}
+}
+
+// 0x14 and 0x15 are documented types carrying a SID at offset 8, so they must
+// not fall through to the unknown-layout path.
+func TestParseACL_ProcessTrustLabelAndAccessFilter(t *testing.T) {
+	sid := buildSID(1, 5, 21, 100, 200, 300, 1000)
+
+	for _, tt := range []struct {
+		name    string
+		aceType byte
+	}{
+		{"SYSTEM_PROCESS_TRUST_LABEL", SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE},
+		{"SYSTEM_ACCESS_FILTER", SYSTEM_ACCESS_FILTER_ACE_TYPE},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			acl, err := parseACL(buildACL(2, buildACE(tt.aceType, 0, 0x1F01FF, sid)))
+			if err != nil {
+				t.Fatalf("parseACL: %v", err)
+			}
+			if !acl.ACEs[0].SIDValid {
+				t.Fatalf("SIDValid = false, want the SID decoded")
+			}
+			if got, want := acl.ACEs[0].SID.String(), "S-1-5-21-100-200-300-1000"; got != want {
+				t.Errorf("SID = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// A descriptor a caller assembled has no parser behind it to set SIDValid, so
+// CollectSids must judge the SID itself rather than the flag.
+func TestCollectSids_CallerConstructedDescriptor(t *testing.T) {
+	valid := Sid{Revision: 1, IdentifierAuthority: 5, SubAuthority: []uint32{21, 100, 200, 300, 1000}}
+	owner := Sid{Revision: 1, IdentifierAuthority: 5, SubAuthority: []uint32{18}}
+
+	sd := &SecurityDescriptor{
+		Owner: &owner,
+		DACL: &ACL{ACEs: []ACE{
+			{Type: ACCESS_ALLOWED_ACE_TYPE, Mask: 0x1F01FF, SID: valid},
+			{Type: ACCESS_DENIED_ACE_TYPE, Mask: 0x2}, // zero SID, never populated
+		}},
+	}
+
+	got := sd.CollectSids()
+	if len(got) != 2 {
+		t.Fatalf("CollectSids() = %v, want the owner and the one valid ACE SID", got)
+	}
+	for _, s := range got {
+		if !s.IsWellFormed() {
+			t.Errorf("CollectSids() returned malformed SID %q", s.String())
 		}
 	}
 }

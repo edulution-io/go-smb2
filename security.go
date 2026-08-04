@@ -33,7 +33,13 @@ type ACE struct {
 	Type  byte
 	Flags byte
 	Mask  uint32
-	SID   Sid
+
+	// SIDValid reports whether the parser read SID off the wire. It is false both
+	// for an entry whose SID could not be read -- SID is then the zero value,
+	// which renders as the legal-looking "S-0-0" -- and for any ACE a caller
+	// assembled. To judge the SID itself, ask SID.IsWellFormed.
+	SID      Sid
+	SIDValid bool
 }
 
 // GetSecurityDescriptor retrieves the NT security descriptor for the file,
@@ -76,34 +82,33 @@ func parseSecurityDescriptor(b []byte) (*SecurityDescriptor, error) {
 		Control:  sd.Control(),
 	}
 
-	// Parse Owner SID
+	// An offset the buffer cannot hold is a framing error; a SID that merely does
+	// not decode leaves the field nil, since failing here would cost the caller the
+	// DACL too. The four offsets are compared as uint64 because they arrive as
+	// uint32: on a 32-bit build int(off) goes negative above 0x7fffffff and passes.
 	if off := sd.OffsetOwner(); off != 0 {
-		if int(off) >= len(b) {
+		if uint64(off) >= uint64(len(b)) {
 			return nil, &InvalidResponseError{"owner SID offset out of bounds"}
 		}
-		sidDec := SidDecoder(b[off:])
-		if sidDec.IsInvalid() {
-			return nil, &InvalidResponseError{"invalid owner SID"}
+		if sidDec := SidDecoder(b[off:]); !sidDec.IsInvalid() {
+			result.Owner = sidDec.Decode()
 		}
-		result.Owner = sidDec.Decode()
 	}
 
 	// Parse Group SID
 	if off := sd.OffsetGroup(); off != 0 {
-		if int(off) >= len(b) {
+		if uint64(off) >= uint64(len(b)) {
 			return nil, &InvalidResponseError{"group SID offset out of bounds"}
 		}
-		sidDec := SidDecoder(b[off:])
-		if sidDec.IsInvalid() {
-			return nil, &InvalidResponseError{"invalid group SID"}
+		if sidDec := SidDecoder(b[off:]); !sidDec.IsInvalid() {
+			result.Group = sidDec.Decode()
 		}
-		result.Group = sidDec.Decode()
 	}
 
 	// Parse DACL
 	if sd.Control()&SE_DACL_PRESENT != 0 {
 		if off := sd.OffsetDacl(); off != 0 {
-			if int(off) >= len(b) {
+			if uint64(off) >= uint64(len(b)) {
 				return nil, &InvalidResponseError{"DACL offset out of bounds"}
 			}
 			acl, err := parseACL(b[off:])
@@ -117,7 +122,7 @@ func parseSecurityDescriptor(b []byte) (*SecurityDescriptor, error) {
 	// Parse SACL
 	if sd.Control()&SE_SACL_PRESENT != 0 {
 		if off := sd.OffsetSacl(); off != 0 {
-			if int(off) >= len(b) {
+			if uint64(off) >= uint64(len(b)) {
 				return nil, &InvalidResponseError{"SACL offset out of bounds"}
 			}
 			acl, err := parseACL(b[off:])
@@ -131,40 +136,51 @@ func parseSecurityDescriptor(b []byte) (*SecurityDescriptor, error) {
 	return result, nil
 }
 
+// minAceSize is the shortest an ACE can be: every concrete type in MS-DTYP 2.4.4.x
+// carries an ACCESS_MASK behind the 4-byte header. Admitting a shorter entry
+// fabricates a reading -- an ACCESS_DENIED with Mask 0 appears to deny nothing.
+const minAceSize = 8
+
+// aclHeaderSize is the fixed ACL header (MS-DTYP 2.4.5).
+const aclHeaderSize = 8
+
 func parseACL(b []byte) (*ACL, error) {
 	hdr := AclHeaderDecoder(b)
 	if hdr.IsInvalid() {
 		return nil, &InvalidResponseError{"invalid ACL header"}
 	}
 
+	// An ACL cannot be smaller than its own header, and the capacity below would
+	// go negative on a declared size of zero.
 	aclSize := int(hdr.AclSize())
-	if aclSize > len(b) {
-		return nil, &InvalidResponseError{"ACL size exceeds buffer"}
+	if aclSize < aclHeaderSize || aclSize > len(b) {
+		return nil, &InvalidResponseError{"invalid ACL size"}
 	}
 	// Restrict parsing to the ACL's declared size.
 	b = b[:aclSize]
 
+	// AceCount is independent of AclSize, so cap it at what the bytes could
+	// describe before it sizes an allocation.
 	aceCount := int(hdr.AceCount())
 	acl := &ACL{
 		Revision: hdr.AclRevision(),
-		ACEs:     make([]ACE, 0, aceCount),
+		ACEs:     make([]ACE, 0, min(aceCount, (aclSize-aclHeaderSize)/minAceSize)),
 	}
 
-	off := 8 // ACL header is 8 bytes
+	off := aclHeaderSize
 	for i := 0; i < aceCount; i++ {
 		if off+4 > len(b) {
 			return nil, &InvalidResponseError{"ACE header out of bounds"}
 		}
 
-		aceDec := AceDecoder(b[off:])
-		if aceDec.IsInvalid() {
-			return nil, &InvalidResponseError{"invalid ACE"}
-		}
-
-		aceSize := int(aceDec.AceSize())
-		if aceSize < 4 || off+aceSize > len(b) {
+		aceSize := int(AceDecoder(b[off:]).AceSize())
+		if aceSize < minAceSize || off+aceSize > len(b) {
 			return nil, &InvalidResponseError{"ACE data out of bounds"}
 		}
+
+		// Bounded to the entry's own size so a field it is too short to hold reads
+		// as absent instead of reaching into the ACE behind it.
+		aceDec := AceDecoder(b[off : off+aceSize])
 
 		ace := ACE{
 			Type:  aceDec.AceType(),
@@ -172,12 +188,11 @@ func parseACL(b []byte) (*ACL, error) {
 			Mask:  aceDec.Mask(),
 		}
 
-		// Parse SID for standard ACE types (Mask at offset 4, SID at offset 8)
-		if aceSize > 8 {
-			sidDec := SidDecoder(b[off+8 : off+aceSize])
-			if !sidDec.IsInvalid() {
-				ace.SID = *sidDec.Decode()
-			}
+		// The entry is kept even when its SID cannot be read: dropping it would
+		// silently change what the ACL grants.
+		if sidDec := aceDec.Sid(); sidDec != nil && !sidDec.IsInvalid() {
+			ace.SID = *sidDec.Decode()
+			ace.SIDValid = true
 		}
 
 		acl.ACEs = append(acl.ACEs, ace)
@@ -320,7 +335,9 @@ const (
 	// SidNameNone: nothing resolved the SID. Name is empty.
 	SidNameNone SidNameSource = iota
 
-	// SidNameLSARPC: the domain controller translated it. Name is DOMAIN\Name --
+	// SidNameLSARPC: the server asserted this translation. The pipe is opened on
+	// the server being browsed, so it means "the server said so", not "verified".
+	// Name is DOMAIN\Name --
 	// or the domain alone for a SID that names a domain, which has no account
 	// half -- and Type carries the SID_NAME_USE the DC reported. Neither half
 	// contains a backslash or a control character, so any separator in Name is the
@@ -355,21 +372,42 @@ type SidName struct {
 // translate -- deleted accounts, principals from a domain this DC does not trust
 // -- and failing the batch over them would discard the names that did resolve.
 // The error reports whether the LSARPC leg itself worked; Source reports what
-// each individual name is worth.
+// each individual name is worth. When no input SID is well-formed enough to ask
+// about, there is no LSARPC leg and the error is nil.
 func (s *Session) LookupSidNames(sids []*Sid) (map[string]SidName, error) {
-	// Deduplicate SIDs
-	unique := make(map[string]*Sid, len(sids))
-	for _, sid := range sids {
-		unique[sid.String()] = sid
+	unique, lookupable := partitionSids(sids)
+
+	if len(lookupable) == 0 {
+		return mergeSidNames(nil, unique), nil
 	}
 
 	// Try LSARPC
-	rpcNames, rpcErr := s.lookupSidsRPC(unique)
+	rpcNames, rpcErr := s.lookupSidsRPC(lookupable)
 	if rpcErr != nil {
 		rpcNames = nil
 	}
 
 	return mergeSidNames(rpcNames, unique), rpcErr
+}
+
+// partitionSids deduplicates by SID string and splits off the subset worth sending
+// to a domain controller. A malformed SID is still answered for, but stays out of
+// the batch: the DC rejects the whole request over one, costing every other SID in
+// it its translation.
+func partitionSids(sids []*Sid) (unique, lookupable map[string]*Sid) {
+	unique = make(map[string]*Sid, len(sids))
+	lookupable = make(map[string]*Sid, len(sids))
+	for _, sid := range sids {
+		if sid == nil {
+			continue
+		}
+		key := sid.String()
+		unique[key] = sid
+		if sid.IsWellFormed() {
+			lookupable[key] = sid
+		}
+	}
+	return unique, lookupable
 }
 
 // mergeSidNames lets the DC's translations win and fills every SID it did not
@@ -611,12 +649,17 @@ func isSidNamePart(s string) bool {
 	return true
 }
 
-// CollectSids extracts all unique SIDs from a SecurityDescriptor.
+// CollectSids extracts all unique SIDs from a SecurityDescriptor, skipping any
+// that cannot name a principal.
+//
+// The filter is well-formedness rather than ACE.SIDValid: a descriptor a caller
+// assembled has no parser behind it to set that flag, and an entry the parser
+// could not read holds the zero SID, which is not well-formed either.
 func (sd *SecurityDescriptor) CollectSids() []*Sid {
 	seen := make(map[string]bool)
 	var result []*Sid
 	add := func(s *Sid) {
-		if s == nil {
+		if !s.IsWellFormed() {
 			return
 		}
 		key := s.String()
@@ -625,18 +668,18 @@ func (sd *SecurityDescriptor) CollectSids() []*Sid {
 			result = append(result, s)
 		}
 	}
+	addACEs := func(acl *ACL) {
+		if acl == nil {
+			return
+		}
+		for i := range acl.ACEs {
+			add(&acl.ACEs[i].SID)
+		}
+	}
 	add(sd.Owner)
 	add(sd.Group)
-	if sd.DACL != nil {
-		for i := range sd.DACL.ACEs {
-			add(&sd.DACL.ACEs[i].SID)
-		}
-	}
-	if sd.SACL != nil {
-		for i := range sd.SACL.ACEs {
-			add(&sd.SACL.ACEs[i].SID)
-		}
-	}
+	addACEs(sd.DACL)
+	addACEs(sd.SACL)
 	return result
 }
 

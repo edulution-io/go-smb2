@@ -721,7 +721,9 @@ func (conn *conn) tryVerify(pkt []byte, isEncrypted bool) error {
 				}
 			}
 		} else {
-			if conn.requireSigning && !isEncrypted {
+			// An interim response carries no signature: the server sends it before
+			// the operation runs. Verifying it fails the request it belongs to.
+			if conn.requireSigning && !isEncrypted && NtStatus(p.Status()) != STATUS_PENDING {
 				if conn.session != nil {
 					if conn.session.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 {
 						if conn.session.sessionId == p.SessionId() {

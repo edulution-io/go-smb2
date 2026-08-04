@@ -26,10 +26,18 @@ type directTCP struct {
 	wv   [2][]byte
 	bufs net.Buffers
 	conn net.Conn
+	// vec is conn when it is a bare TCP socket. net.Buffers.WriteTo reaches the
+	// writeBuffers promoted from an embedded *net.TCPConn, so a caller's wrapper
+	// that overrides Write would be written straight past; only the concrete type
+	// can take the vector.
+	vec *net.TCPConn
 }
 
 func direct(tcpConn net.Conn) transport {
-	return &directTCP{conn: tcpConn}
+	t := &directTCP{conn: tcpConn}
+	t.vec, _ = tcpConn.(*net.TCPConn)
+
+	return t
 }
 
 func (t *directTCP) Write(p []byte) (n int, err error) {
@@ -41,15 +49,25 @@ func (t *directTCP) Write(p []byte) (n int, err error) {
 
 	be.PutUint32(bs, uint32(len(p)))
 
+	if t.vec == nil {
+		_, err = t.conn.Write(bs)
+		if err != nil {
+			return -1, err
+		}
+
+		return t.conn.Write(p)
+	}
+
 	// WriteTo consumes the vector, so rebuild it from wv on every write.
 	t.bufs = append(net.Buffers(t.wv[:0]), bs, p)
 
-	written, err := t.bufs.WriteTo(t.conn)
+	written, err := t.bufs.WriteTo(t.vec)
 	if err != nil {
 		return -1, err
 	}
 
-	return int(written), nil
+	// The prefix is framing, not payload; report what the caller handed us.
+	return int(written) - len(bs), nil
 }
 
 func (t *directTCP) ReadSize() (size int, err error) {

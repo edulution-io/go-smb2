@@ -34,8 +34,10 @@ type ACE struct {
 	Flags byte
 	Mask  uint32
 
-	// SID is meaningful only when SIDValid is true; the zero value renders as
-	// "S-0-0", which is indistinguishable from a SID the server sent.
+	// SIDValid reports whether the parser read SID off the wire. It is false both
+	// for an entry whose SID could not be read -- SID is then the zero value,
+	// which renders as the legal-looking "S-0-0" -- and for any ACE a caller
+	// assembled. To judge the SID itself, ask SID.IsWellFormed.
 	SID      Sid
 	SIDValid bool
 }

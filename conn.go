@@ -706,6 +706,8 @@ func (conn *conn) tryDecrypt(pkt []byte) ([]byte, error, bool) {
 	return pkt, nil, false
 }
 
+const interimResponseFlags = SMB2_FLAGS_SERVER_TO_REDIR | SMB2_FLAGS_ASYNC_COMMAND
+
 func (conn *conn) tryVerify(pkt []byte, isEncrypted bool) error {
 	p := PacketCodec(pkt)
 
@@ -721,7 +723,12 @@ func (conn *conn) tryVerify(pkt []byte, isEncrypted bool) error {
 				}
 			}
 		} else {
-			if conn.requireSigning && !isEncrypted {
+			// An interim response carries no signature: the server sends it before
+			// the operation runs. Verifying it fails the request it belongs to.
+			isInterim := NtStatus(p.Status()) == STATUS_PENDING &&
+				p.Flags()&interimResponseFlags == interimResponseFlags
+
+			if conn.requireSigning && !isEncrypted && !isInterim {
 				if conn.session != nil {
 					if conn.session.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 {
 						if conn.session.sessionId == p.SessionId() {

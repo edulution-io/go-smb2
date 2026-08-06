@@ -140,11 +140,17 @@ func (c SymbolicLinkReparseDataBufferDecoder) PrintName() string {
 
 type SrvRequestResumeKeyResponseDecoder []byte
 
+// IsInvalid reports whether the buffer does not hold a decodable response. Same
+// two defects as FileQuotaInformationDecoder.IsInvalid, but on a path a server
+// reaches: ContextLength was read out of c[24:28] before the buffer was known to
+// be that long, and 28+ContextLength() wraps in uint32 arithmetic, so a length
+// of 0xFFFFFFFF turned the guard into len(c) < 27.
 func (c SrvRequestResumeKeyResponseDecoder) IsInvalid() bool {
-	if len(c) < int(28+c.ContextLength()) {
+	if len(c) < 28 {
 		return true
 	}
-	return false
+
+	return uint64(len(c)) < 28+uint64(c.ContextLength())
 }
 
 func (c SrvRequestResumeKeyResponseDecoder) ResumeKey() []byte {

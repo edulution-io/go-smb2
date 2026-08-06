@@ -70,6 +70,70 @@ func TestFileQuotaInformationDecoderSidSliceableWhenValid(t *testing.T) {
 	}
 }
 
+// resumeKeyResponse builds an SRV_REQUEST_RESUME_KEY response of total length n
+// whose ContextLength field carries ctxLen, so the two can be set apart.
+func resumeKeyResponse(n int, ctxLen uint32) SrvRequestResumeKeyResponseDecoder {
+	b := make([]byte, n)
+	if n >= 28 {
+		le.PutUint32(b[24:28], ctxLen)
+	}
+	return SrvRequestResumeKeyResponseDecoder(b)
+}
+
+// Unlike the quota decoder this one is reachable: File.copyTo decodes it, and
+// copyTo is what File.ReadFrom and File.WriteTo dispatch to, so a short or
+// hostile ioctl response reaches it through any io.Copy between two SMB files.
+func TestSrvRequestResumeKeyResponseDecoderIsInvalid(t *testing.T) {
+	tests := []struct {
+		name    string
+		buf     SrvRequestResumeKeyResponseDecoder
+		invalid bool
+	}{
+		{"empty", SrvRequestResumeKeyResponseDecoder(nil), true},
+		{"resume key only, no ContextLength", resumeKeyResponse(24, 0), true},
+		{"one byte short of the fixed fields", resumeKeyResponse(27, 0), true},
+		{"fixed fields only, empty context", resumeKeyResponse(28, 0), false},
+		{"context fully present", resumeKeyResponse(32, 4), false},
+		{"context one byte short", resumeKeyResponse(31, 4), true},
+		{"ContextLength wraps the sum to 27", resumeKeyResponse(28, 0xFFFFFFFF), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.buf.IsInvalid(); got != tt.invalid {
+				t.Errorf("IsInvalid() = %v, want %v", got, tt.invalid)
+			}
+		})
+	}
+}
+
+// What copyTo does once IsInvalid clears: it copies ResumeKey into the
+// copychunk request. Context is covered too, since the wrap defect is what
+// would let it slice past the end.
+func TestSrvRequestResumeKeyResponseDecoderSliceableWhenValid(t *testing.T) {
+	cases := []SrvRequestResumeKeyResponseDecoder{
+		resumeKeyResponse(28, 0),
+		resumeKeyResponse(32, 4),
+		resumeKeyResponse(28, 0xFFFFFFFF),
+		resumeKeyResponse(27, 0),
+	}
+
+	for _, c := range cases {
+		if c.IsInvalid() {
+			continue
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("slicing panicked on a buffer IsInvalid cleared (len=%d): %v", len(c), r)
+				}
+			}()
+			_ = c.ResumeKey()
+			_ = c.Context()
+		}()
+	}
+}
+
 // MS-FSCC 2.4.11 defines FILE_DISPOSITION_INFORMATION as a single BOOLEAN.
 // Size feeds InputBufferLength, so reporting 4 declared three padding bytes as
 // payload on every SMB2 SET_INFO that deletes a file.

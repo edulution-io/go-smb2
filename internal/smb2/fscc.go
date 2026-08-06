@@ -140,11 +140,17 @@ func (c SymbolicLinkReparseDataBufferDecoder) PrintName() string {
 
 type SrvRequestResumeKeyResponseDecoder []byte
 
+// IsInvalid reports whether the buffer does not hold a decodable response. Same
+// two defects as FileQuotaInformationDecoder.IsInvalid, but on a path a server
+// reaches: ContextLength was read out of c[24:28] before the buffer was known to
+// be that long, and 28+ContextLength() wraps in uint32 arithmetic, so a length
+// of 0xFFFFFFFF turned the guard into len(c) < 27.
 func (c SrvRequestResumeKeyResponseDecoder) IsInvalid() bool {
-	if len(c) < int(28+c.ContextLength()) {
+	if len(c) < 28 {
 		return true
 	}
-	return false
+
+	return uint64(len(c)) < 28+uint64(c.ContextLength())
 }
 
 func (c SrvRequestResumeKeyResponseDecoder) ResumeKey() []byte {
@@ -390,8 +396,13 @@ type FileDispositionInformationEncoder struct {
 	DeletePending uint8
 }
 
+// Size reports 1: MS-FSCC 2.4.11 defines FILE_DISPOSITION_INFORMATION as a
+// single BOOLEAN. Reporting 4 declared three padding bytes as payload in
+// InputBufferLength, which Samba tolerates and stricter servers answer with
+// STATUS_INFO_LENGTH_MISMATCH. The 4-byte Flags field belongs to the separate
+// FILE_DISPOSITION_INFORMATION_EX class.
 func (c *FileDispositionInformationEncoder) Size() int {
-	return 4
+	return 1
 }
 
 func (c *FileDispositionInformationEncoder) Encode(p []byte) {
@@ -438,8 +449,16 @@ func (c FileFsFullSizeInformationDecoder) BytesPerSector() uint32 {
 
 type FileQuotaInformationDecoder []byte
 
+// IsInvalid reports whether the buffer does not hold a decodable entry. The
+// fixed fields are established before SidLength is read, and the total is
+// compared in uint64 because 40+SidLength() wraps in uint32 arithmetic -- the
+// guard would then clear a length that Sid slices past the end with.
 func (c FileQuotaInformationDecoder) IsInvalid() bool {
-	return len(c) < int(40+c.SidLength())
+	if len(c) < 40 {
+		return true
+	}
+
+	return uint64(len(c)) < 40+uint64(c.SidLength())
 }
 
 func (c FileQuotaInformationDecoder) NextEntryOffset() uint32 {

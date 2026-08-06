@@ -438,8 +438,16 @@ func (c FileFsFullSizeInformationDecoder) BytesPerSector() uint32 {
 
 type FileQuotaInformationDecoder []byte
 
+// IsInvalid reports whether the buffer does not hold a decodable entry. The
+// fixed fields are established before SidLength is read, and the total is
+// compared in uint64 because 40+SidLength() wraps in uint32 arithmetic -- the
+// guard would then clear a length that Sid slices past the end with.
 func (c FileQuotaInformationDecoder) IsInvalid() bool {
-	return len(c) < int(40+c.SidLength())
+	if len(c) < 40 {
+		return true
+	}
+
+	return uint64(len(c)) < 40+uint64(c.SidLength())
 }
 
 func (c FileQuotaInformationDecoder) NextEntryOffset() uint32 {

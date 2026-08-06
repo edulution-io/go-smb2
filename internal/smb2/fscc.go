@@ -390,8 +390,13 @@ type FileDispositionInformationEncoder struct {
 	DeletePending uint8
 }
 
+// Size reports 1: MS-FSCC 2.4.11 defines FILE_DISPOSITION_INFORMATION as a
+// single BOOLEAN. Reporting 4 declared three padding bytes as payload in
+// InputBufferLength, which Samba tolerates and stricter servers answer with
+// STATUS_INFO_LENGTH_MISMATCH. The 4-byte Flags field belongs to the separate
+// FILE_DISPOSITION_INFORMATION_EX class.
 func (c *FileDispositionInformationEncoder) Size() int {
-	return 4
+	return 1
 }
 
 func (c *FileDispositionInformationEncoder) Encode(p []byte) {

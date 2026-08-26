@@ -141,7 +141,7 @@ func (c SymbolicLinkReparseDataBufferDecoder) PrintName() string {
 type SrvRequestResumeKeyResponseDecoder []byte
 
 func (c SrvRequestResumeKeyResponseDecoder) IsInvalid() bool {
-	if len(c) < int(28+c.ContextLength()) {
+	if uint64(len(c)) < 28+uint64(c.ContextLength()) {
 		return true
 	}
 	return false
@@ -302,8 +302,19 @@ const (
 
 type FileDirectoryInformationDecoder []byte
 
+// Widened to uint64 before the addition, not after.
+//
+// The length is supplied by the server. Adding a constant to it in
+// uint32 wraps: a FileNameLength of 0xFFFFFFFF made 64+len come to 63,
+// the comparison passed, and the decoder went on to slice the buffer by
+// a length this function had just failed to reject — an out-of-bounds
+// read, from a directory listing, against any server willing to send it.
+//
+// On a 64-bit platform the window is 0xFFFFFFC0 upwards, where the
+// uint32 sum itself wraps. On a 32-bit one it is far wider, because int
+// is 32 bits there and the conversion overflows too.
 func (c FileDirectoryInformationDecoder) IsInvalid() bool {
-	return len(c) < int(64+c.FileNameLength())
+	return uint64(len(c)) < 64+uint64(c.FileNameLength())
 }
 
 func (c FileDirectoryInformationDecoder) NextEntryOffset() uint32 {
@@ -439,7 +450,7 @@ func (c FileFsFullSizeInformationDecoder) BytesPerSector() uint32 {
 type FileQuotaInformationDecoder []byte
 
 func (c FileQuotaInformationDecoder) IsInvalid() bool {
-	return len(c) < int(40+c.SidLength())
+	return uint64(len(c)) < 40+uint64(c.SidLength())
 }
 
 func (c FileQuotaInformationDecoder) NextEntryOffset() uint32 {
@@ -681,7 +692,7 @@ func (c FileNameInformationDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(c) < int(4+c.FileNameLength()) {
+	if uint64(len(c)) < 4+uint64(c.FileNameLength()) {
 		return true
 	}
 

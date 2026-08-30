@@ -509,7 +509,7 @@ func (fs *Share) Rename(oldpath, newpath string) error {
 		FileInfoClass:         FileRenameInformation,
 		AdditionalInformation: 0,
 		Input: &FileRenameInformationType2Encoder{
-			ReplaceIfExists: 0,
+			ReplaceIfExists: 1,
 			RootDirectory:   0,
 			FileName:        newpath,
 		},

@@ -554,6 +554,19 @@ func (conn *conn) runReciever() {
 			p := PacketCodec(pkt)
 
 			if off := p.NextCommand(); off != 0 {
+				// The offset comes from the server and the slices below
+				// trust it. One past the end of the packet panics; one
+				// inside the 64-byte header points a "next packet" at
+				// part of this one.
+				//
+				// A malformed compound response is a reason to stop
+				// reading it, not to stop the connection, so the
+				// remainder is dropped and the entries already handled
+				// stand.
+				if off < 64 || uint64(off) > uint64(len(pkt)) {
+					logger.Println("skip:", &InvalidResponseError{"NextCommand offset out of bounds"})
+					break
+				}
 				pkt, next = pkt[:off], pkt[off:]
 			} else {
 				next = nil

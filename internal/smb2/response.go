@@ -843,6 +843,12 @@ func (r CreateResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
+	// A non-empty buffer whose offset points into the fixed fields is
+	// malformed; the accessor would return nil, which reads as "no data".
+	if r.CreateContextsLength() != 0 && coff < 88+64 {
+		return true
+	}
+
 	return false
 }
 
@@ -1097,6 +1103,12 @@ func (r ReadResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
+	// Data() returns nil for an offset inside the fixed fields, and readAt
+	// takes an empty Data() as EOF, so this has to be rejected here.
+	if r.DataLength() != 0 && r.DataOffset() < 16+64 {
+		return true
+	}
+
 	return false
 }
 
@@ -1277,6 +1289,14 @@ func (r IoctlResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
+	if r.InputCount() != 0 && r.InputOffset() < 64+48 {
+		return true
+	}
+
+	if r.OutputCount() != 0 && r.OutputOffset() < 64+48 {
+		return true
+	}
+
 	return false
 }
 
@@ -1386,6 +1406,10 @@ func (r QueryDirectoryResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
+	if r.OutputBufferLength() != 0 && r.OutputBufferOffset() < 64+8 {
+		return true
+	}
+
 	return false
 }
 
@@ -1467,6 +1491,10 @@ func (r QueryInfoResponseDecoder) IsInvalid() bool {
 	}
 
 	if uint64(len(r))+64 < uint64(r.OutputBufferOffset())+uint64(r.OutputBufferLength()) {
+		return true
+	}
+
+	if r.OutputBufferLength() != 0 && r.OutputBufferOffset() < 64+8 {
 		return true
 	}
 

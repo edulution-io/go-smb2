@@ -10,7 +10,7 @@ type boundsCase struct {
 	name    string
 	invalid bool
 	dec     interface{ IsInvalid() bool }
-	access  func()
+	access  func(t *testing.T)
 }
 
 func runBoundsCases(t *testing.T, cases []boundsCase) {
@@ -28,7 +28,7 @@ func runBoundsCases(t *testing.T, cases []boundsCase) {
 					t.Errorf("accessor panicked on a buffer IsInvalid cleared: %v", r)
 				}
 			}()
-			tt.access()
+			tt.access(t)
 		})
 	}
 }
@@ -51,7 +51,7 @@ func errorResponse(n int, byteCount uint32) ErrorResponseDecoder {
 // r[8:7]. This runs on every non-success status the server returns.
 func TestErrorResponseDecoderBounds(t *testing.T) {
 	mk := func(name string, invalid bool, d ErrorResponseDecoder) boundsCase {
-		return boundsCase{name, invalid, d, func() { _ = d.ErrorData() }}
+		return boundsCase{name, invalid, d, func(*testing.T) { _ = d.ErrorData() }}
 	}
 	runBoundsCases(t, []boundsCase{
 		mk("empty", true, ErrorResponseDecoder(nil)),
@@ -75,7 +75,7 @@ func errorContext(n int, dataLen uint32) ErrorContextResponseDecoder {
 
 func TestErrorContextResponseDecoderBounds(t *testing.T) {
 	mk := func(name string, invalid bool, d ErrorContextResponseDecoder) boundsCase {
-		return boundsCase{name, invalid, d, func() { _ = d.ErrorContextData() }}
+		return boundsCase{name, invalid, d, func(*testing.T) { _ = d.ErrorContextData() }}
 	}
 	runBoundsCases(t, []boundsCase{
 		mk("empty", true, ErrorContextResponseDecoder(nil)),
@@ -102,7 +102,13 @@ func readResponse(n int, dataOff uint8, dataLen uint32) ReadResponseDecoder {
 // the int() conversion saw a value smaller than the 16-byte header.
 func TestReadResponseDecoderBounds(t *testing.T) {
 	mk := func(name string, invalid bool, d ReadResponseDecoder) boundsCase {
-		return boundsCase{name, invalid, d, func() { _ = d.Data() }}
+		return boundsCase{name, invalid, d, func(t *testing.T) {
+			// readAt takes an empty Data() as EOF, so a cleared buffer has to
+			// yield exactly DataLength bytes.
+			if got := len(d.Data()); got != int(d.DataLength()) {
+				t.Errorf("len(Data()) = %d, want %d", got, d.DataLength())
+			}
+		}}
 	}
 	runBoundsCases(t, []boundsCase{
 		mk("empty", true, ReadResponseDecoder(nil)),
@@ -110,6 +116,8 @@ func TestReadResponseDecoderBounds(t *testing.T) {
 		mk("fixed fields only", false, readResponse(16, 80, 0)),
 		mk("data fully present", false, readResponse(80, 80, 64)),
 		mk("data one byte short", true, readResponse(79, 80, 64)),
+		mk("data present but offset inside the fixed fields", true, readResponse(80, 16, 64)),
+		mk("offset zero with no data", false, readResponse(16, 0, 0)),
 		mk("DataLength wraps the sum to 79", true, readResponse(256, 80, 0xFFFFFFFF)),
 		mk("DataLength wraps the sum to 0", true, readResponse(256, 80, 0xFFFFFFB0)),
 	})
@@ -130,7 +138,7 @@ func createResponse(n int, coff, clen uint32) CreateResponseDecoder {
 // r[88:4294967232].
 func TestCreateResponseDecoderBounds(t *testing.T) {
 	mk := func(name string, invalid bool, d CreateResponseDecoder) boundsCase {
-		return boundsCase{name, invalid, d, func() { _ = d.CreateContexts() }}
+		return boundsCase{name, invalid, d, func(*testing.T) { _ = d.CreateContexts() }}
 	}
 	runBoundsCases(t, []boundsCase{
 		mk("empty", true, CreateResponseDecoder(nil)),
@@ -139,6 +147,7 @@ func TestCreateResponseDecoderBounds(t *testing.T) {
 		mk("contexts fully present", false, createResponse(120, 152, 32)),
 		mk("contexts one byte short", true, createResponse(119, 152, 32)),
 		mk("offset misaligned", true, createResponse(120, 156, 32)),
+		mk("contexts present but offset inside the fixed fields", true, createResponse(120, 88, 32)),
 		mk("length wraps the sum to 0", true, createResponse(120, 152, 0xFFFFFF68)),
 		mk("length wraps the sum below the offset", true, createResponse(120, 152, 0xFFFFFFFF)),
 	})
@@ -158,7 +167,7 @@ func ioctlResponse(n int, inOff, inCnt, outOff, outCnt uint32) IoctlResponseDeco
 
 func TestIoctlResponseDecoderBounds(t *testing.T) {
 	mk := func(name string, invalid bool, d IoctlResponseDecoder) boundsCase {
-		return boundsCase{name, invalid, d, func() { _ = d.Input(); _ = d.Output() }}
+		return boundsCase{name, invalid, d, func(*testing.T) { _ = d.Input(); _ = d.Output() }}
 	}
 	runBoundsCases(t, []boundsCase{
 		mk("empty", true, IoctlResponseDecoder(nil)),
@@ -168,6 +177,8 @@ func TestIoctlResponseDecoderBounds(t *testing.T) {
 		mk("output one byte short", true, ioctlResponse(79, 0, 0, 112, 32)),
 		mk("input fully present", false, ioctlResponse(80, 112, 32, 0, 0)),
 		mk("input one byte short", true, ioctlResponse(79, 112, 32, 0, 0)),
+		mk("output present but offset inside the fixed fields", true, ioctlResponse(80, 0, 0, 64, 32)),
+		mk("input present but offset inside the fixed fields", true, ioctlResponse(80, 64, 32, 0, 0)),
 		mk("OutputCount wraps the sum to 47", true, ioctlResponse(80, 0, 0, 112, 0xFFFFFFFF)),
 		mk("InputCount wraps the sum to 47", true, ioctlResponse(80, 112, 0xFFFFFFFF, 0, 0)),
 	})
@@ -185,7 +196,7 @@ func queryDirectoryResponse(n int, off uint16, length uint32) QueryDirectoryResp
 
 func TestQueryDirectoryResponseDecoderBounds(t *testing.T) {
 	mk := func(name string, invalid bool, d QueryDirectoryResponseDecoder) boundsCase {
-		return boundsCase{name, invalid, d, func() { _ = d.OutputBuffer() }}
+		return boundsCase{name, invalid, d, func(*testing.T) { _ = d.OutputBuffer() }}
 	}
 	runBoundsCases(t, []boundsCase{
 		mk("empty", true, QueryDirectoryResponseDecoder(nil)),
@@ -193,6 +204,7 @@ func TestQueryDirectoryResponseDecoderBounds(t *testing.T) {
 		mk("fixed fields only", false, queryDirectoryResponse(8, 72, 0)),
 		mk("output fully present", false, queryDirectoryResponse(72, 72, 64)),
 		mk("output one byte short", true, queryDirectoryResponse(71, 72, 64)),
+		mk("output present but offset inside the fixed fields", true, queryDirectoryResponse(72, 8, 64)),
 		mk("OutputBufferLength wraps the sum to 71", true, queryDirectoryResponse(72, 72, 0xFFFFFFFF)),
 	})
 }
@@ -203,7 +215,7 @@ func queryInfoResponse(n int, off uint16, length uint32) QueryInfoResponseDecode
 
 func TestQueryInfoResponseDecoderBounds(t *testing.T) {
 	mk := func(name string, invalid bool, d QueryInfoResponseDecoder) boundsCase {
-		return boundsCase{name, invalid, d, func() { _ = d.OutputBuffer() }}
+		return boundsCase{name, invalid, d, func(*testing.T) { _ = d.OutputBuffer() }}
 	}
 	runBoundsCases(t, []boundsCase{
 		mk("empty", true, QueryInfoResponseDecoder(nil)),
@@ -211,6 +223,7 @@ func TestQueryInfoResponseDecoderBounds(t *testing.T) {
 		mk("fixed fields only", false, queryInfoResponse(8, 72, 0)),
 		mk("output fully present", false, queryInfoResponse(72, 72, 64)),
 		mk("output one byte short", true, queryInfoResponse(71, 72, 64)),
+		mk("output present but offset inside the fixed fields", true, queryInfoResponse(72, 8, 64)),
 		mk("OutputBufferLength wraps the sum to 71", true, queryInfoResponse(72, 72, 0xFFFFFFFF)),
 	})
 }

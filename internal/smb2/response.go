@@ -401,7 +401,9 @@ func (r NegotiateResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(r) < int(r.SecurityBufferOffset()+r.SecurityBufferLength())-64 {
+	// Offsets are relative to the packet header, which is 64 bytes before r.
+	// Summed in uint64 so a server-supplied length cannot wrap the check.
+	if uint64(len(r))+64 < uint64(r.SecurityBufferOffset())+uint64(r.SecurityBufferLength()) {
 		return true
 	}
 
@@ -412,7 +414,7 @@ func (r NegotiateResponseDecoder) IsInvalid() bool {
 			return true
 		}
 
-		if len(r) < int(noff)-64 {
+		if uint64(len(r))+64 < uint64(noff) {
 			return true
 		}
 	}
@@ -473,13 +475,12 @@ func (r NegotiateResponseDecoder) SecurityBufferLength() uint16 {
 // }
 
 func (r NegotiateResponseDecoder) SecurityBuffer() []byte {
-	off := r.SecurityBufferOffset()
+	off := int(r.SecurityBufferOffset())
 	if off < 64+64 {
 		return nil
 	}
 	off -= 64
-	len := r.SecurityBufferLength()
-	return r[off : off+len]
+	return r[off : off+int(r.SecurityBufferLength())]
 }
 
 // From SMB311
@@ -551,7 +552,7 @@ func (r SessionSetupResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(r) < int(r.SecurityBufferOffset()+r.SecurityBufferLength())-64 {
+	if uint64(len(r))+64 < uint64(r.SecurityBufferOffset())+uint64(r.SecurityBufferLength()) {
 		return true
 	}
 
@@ -579,13 +580,12 @@ func (r SessionSetupResponseDecoder) SecurityBufferLength() uint16 {
 // }
 
 func (r SessionSetupResponseDecoder) SecurityBuffer() []byte {
-	off := r.SecurityBufferOffset()
+	off := int(r.SecurityBufferOffset())
 	if off < 8+64 {
 		return nil
 	}
 	off -= 64
-	len := r.SecurityBufferLength()
-	return r[off : off+len]
+	return r[off : off+int(r.SecurityBufferLength())]
 }
 
 // ----------------------------------------------------------------------------

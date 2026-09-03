@@ -150,3 +150,128 @@ func TestFileDispositionInformationEncoderSize(t *testing.T) {
 		t.Errorf("Encode wrote DeletePending = %d, want 1", p[0])
 	}
 }
+
+// directoryEntry builds a FileDirectoryInformation entry of total length n
+// whose FileNameLength field carries nameLen, so the two can be set apart.
+func directoryEntry(n int, nameLen uint32) FileDirectoryInformationDecoder {
+	b := make([]byte, n)
+	if n >= 64 {
+		le.PutUint32(b[60:64], nameLen)
+	}
+	return FileDirectoryInformationDecoder(b)
+}
+
+// Two defects. The guard read FileNameLength out of c[60:64] before knowing
+// the buffer was 64 bytes long, so a short entry panicked inside IsInvalid
+// itself. And it added the constant in uint32, so a FileNameLength of
+// 0xFFFFFFFF wrapped 64+len to 63 and FileName sliced c[64:63].
+func TestFileDirectoryInformationDecoderIsInvalid(t *testing.T) {
+	tests := []struct {
+		name    string
+		buf     FileDirectoryInformationDecoder
+		invalid bool
+	}{
+		{"empty", FileDirectoryInformationDecoder(nil), true},
+		{"too short to hold FileNameLength", directoryEntry(8, 0), true},
+		{"shorter than the fixed fields", directoryEntry(63, 0), true},
+		{"fixed fields only, empty name", directoryEntry(64, 0), false},
+		{"name fully present", directoryEntry(72, 8), false},
+		{"name one byte short", directoryEntry(71, 8), true},
+		{"FileNameLength wraps the sum to 63", directoryEntry(64, 0xFFFFFFFF), true},
+		{"FileNameLength wraps the sum to 0", directoryEntry(64, 0xFFFFFFC0), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("IsInvalid() panicked (len=%d): %v", len(tt.buf), r)
+				}
+			}()
+			if got := tt.buf.IsInvalid(); got != tt.invalid {
+				t.Errorf("IsInvalid() = %v, want %v", got, tt.invalid)
+			}
+		})
+	}
+}
+
+func TestFileDirectoryInformationDecoderFileNameSliceableWhenValid(t *testing.T) {
+	cases := []FileDirectoryInformationDecoder{
+		directoryEntry(64, 0),
+		directoryEntry(72, 8),
+		directoryEntry(64, 0xFFFFFFFF),
+		directoryEntry(64, 0xFFFFFFC0),
+	}
+
+	for _, c := range cases {
+		if c.IsInvalid() {
+			continue
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("FileName() panicked on a buffer IsInvalid cleared (len=%d, FileNameLength=%d): %v",
+						len(c), c.FileNameLength(), r)
+				}
+			}()
+			_ = c.FileName()
+		}()
+	}
+}
+
+// nameInfo builds a FileNameInformation buffer of total length n whose
+// FileNameLength field carries nameLen.
+func nameInfo(n int, nameLen uint32) FileNameInformationDecoder {
+	b := make([]byte, n)
+	if n >= 4 {
+		le.PutUint32(b[0:4], nameLen)
+	}
+	return FileNameInformationDecoder(b)
+}
+
+// Same wrap as the directory entry: 4+0xFFFFFFFF came to 3 in uint32.
+func TestFileNameInformationDecoderIsInvalid(t *testing.T) {
+	tests := []struct {
+		name    string
+		buf     FileNameInformationDecoder
+		invalid bool
+	}{
+		{"empty", FileNameInformationDecoder(nil), true},
+		{"shorter than the fixed fields", nameInfo(3, 0), true},
+		{"fixed fields only, empty name", nameInfo(4, 0), false},
+		{"name fully present", nameInfo(12, 8), false},
+		{"name one byte short", nameInfo(11, 8), true},
+		{"FileNameLength wraps the sum to 3", nameInfo(4, 0xFFFFFFFF), true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.buf.IsInvalid(); got != tt.invalid {
+				t.Errorf("IsInvalid() = %v, want %v", got, tt.invalid)
+			}
+		})
+	}
+}
+
+func TestFileNameInformationDecoderFileNameSliceableWhenValid(t *testing.T) {
+	cases := []FileNameInformationDecoder{
+		nameInfo(4, 0),
+		nameInfo(12, 8),
+		nameInfo(4, 0xFFFFFFFF),
+	}
+
+	for _, c := range cases {
+		if c.IsInvalid() {
+			continue
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("FileName() panicked on a buffer IsInvalid cleared (len=%d, FileNameLength=%d): %v",
+						len(c), c.FileNameLength(), r)
+				}
+			}()
+			_ = c.FileName()
+		}()
+	}
+}

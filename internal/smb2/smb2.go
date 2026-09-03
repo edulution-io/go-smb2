@@ -149,8 +149,7 @@ func (ctx NegotiateContextDecoder) DataLength() uint16 {
 }
 
 func (ctx NegotiateContextDecoder) Data() []byte {
-	len := ctx.DataLength()
-	return ctx[8 : 8+len]
+	return ctx[8 : 8+int(ctx.DataLength())]
 }
 
 func (ctx NegotiateContextDecoder) Next() int {
@@ -191,9 +190,8 @@ func (h HashContextDataDecoder) HashAlgorithms() []uint16 {
 }
 
 func (h HashContextDataDecoder) Salt() []byte {
-	off := 4 + h.HashAlgorithmCount()*2
-	len := h.SaltLength()
-	return h[off : off+len]
+	off := 4 + int(h.HashAlgorithmCount())*2
+	return h[off : off+int(h.SaltLength())]
 }
 
 type CipherContextDataDecoder []byte

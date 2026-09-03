@@ -78,7 +78,11 @@ func TestNegotiateResponseDecoderAccessorsSliceableWhenValid(t *testing.T) {
 				}
 			}()
 			_ = c.SecurityBuffer()
-			_ = c.NegotiateContextList()
+			// The context offset is only validated for SMB 3.1.1; on older
+			// dialects the field is reserved and conn.go never reads it.
+			if c.DialectRevision() == SMB311 {
+				_ = c.NegotiateContextList()
+			}
 		}()
 	}
 }
@@ -181,8 +185,8 @@ func TestNegotiateContextDecoderDataSliceableWhenValid(t *testing.T) {
 	}
 }
 
-func hashContextData(algCount, saltLen uint16, extra int) HashContextDataDecoder {
-	b := make([]byte, 4+int(algCount)*2+int(saltLen)+extra)
+func hashContextData(algCount, saltLen uint16) HashContextDataDecoder {
+	b := make([]byte, 4+int(algCount)*2+int(saltLen))
 	le.PutUint16(b[0:2], algCount)
 	le.PutUint16(b[2:4], saltLen)
 	return HashContextDataDecoder(b)
@@ -192,9 +196,9 @@ func hashContextData(algCount, saltLen uint16, extra int) HashContextDataDecoder
 // the offset at 0 and returned the head of the buffer as the salt.
 func TestHashContextDataDecoderSalt(t *testing.T) {
 	cases := []HashContextDataDecoder{
-		hashContextData(1, 32, 0),
-		hashContextData(0x7FFE, 16, 0),
-		hashContextData(0xFFFF, 0xFFFF, 0),
+		hashContextData(1, 32),
+		hashContextData(0x7FFE, 16),
+		hashContextData(0xFFFF, 0xFFFF),
 	}
 
 	for _, c := range cases {

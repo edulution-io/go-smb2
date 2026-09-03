@@ -50,7 +50,7 @@ func (r ErrorResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if uint32(len(r)) < 8+r.ByteCount() {
+	if uint64(len(r)) < 8+uint64(r.ByteCount()) {
 		return true
 	}
 
@@ -70,7 +70,7 @@ func (r ErrorResponseDecoder) ByteCount() uint32 {
 }
 
 func (r ErrorResponseDecoder) ErrorData() []byte {
-	return r[8 : 8+r.ByteCount()]
+	return r[8 : 8+int(r.ByteCount())]
 }
 
 // ----------------------------------------------------------------------------
@@ -126,7 +126,7 @@ func (ctx ErrorContextResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if uint32(len(ctx)) < 8+ctx.ErrorDataLength() {
+	if uint64(len(ctx)) < 8+uint64(ctx.ErrorDataLength()) {
 		return true
 	}
 
@@ -142,7 +142,7 @@ func (ctx ErrorContextResponseDecoder) ErrorId() uint32 {
 }
 
 func (ctx ErrorContextResponseDecoder) ErrorContextData() []byte {
-	return ctx[8 : 8+ctx.ErrorDataLength()]
+	return ctx[8 : 8+int(ctx.ErrorDataLength())]
 }
 
 func (ctx ErrorContextResponseDecoder) Next() int {
@@ -217,7 +217,7 @@ func (r SymbolicLinkErrorResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	tlen := int(r.SymLinkLength())
+	tlen := uint64(r.SymLinkLength())
 	rlen := int(r.ReparseDataLength())
 	soff := int(r.SubstituteNameOffset())
 	slen := int(r.SubstituteNameLength())
@@ -228,11 +228,11 @@ func (r SymbolicLinkErrorResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(r) < 4+tlen {
+	if uint64(len(r)) < 4+tlen {
 		return true
 	}
 
-	if tlen < 12+rlen {
+	if tlen < 12+uint64(rlen) {
 		return true
 	}
 
@@ -288,15 +288,13 @@ func (r SymbolicLinkErrorResponseDecoder) PathBuffer() []byte {
 }
 
 func (r SymbolicLinkErrorResponseDecoder) SubstituteName() string {
-	off := r.SubstituteNameOffset()
-	len := r.SubstituteNameLength()
-	return utf16le.DecodeToString(r.PathBuffer()[off : off+len])
+	off := int(r.SubstituteNameOffset())
+	return utf16le.DecodeToString(r.PathBuffer()[off : off+int(r.SubstituteNameLength())])
 }
 
 func (r SymbolicLinkErrorResponseDecoder) PrintName() string {
-	off := r.PrintNameOffset()
-	len := r.PrintNameLength()
-	return utf16le.DecodeToString(r.PathBuffer()[off : off+len])
+	off := int(r.PrintNameOffset())
+	return utf16le.DecodeToString(r.PathBuffer()[off : off+int(r.PrintNameLength())])
 }
 
 func (r SymbolicLinkErrorResponseDecoder) SplitUnparsedPath(name string) (string, string) {
@@ -841,7 +839,7 @@ func (r CreateResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(r) < int(coff+r.CreateContextsLength())-64 {
+	if uint64(len(r))+64 < uint64(coff)+uint64(r.CreateContextsLength()) {
 		return true
 	}
 
@@ -909,13 +907,12 @@ func (r CreateResponseDecoder) CreateContextsLength() uint32 {
 // }
 
 func (r CreateResponseDecoder) CreateContexts() []byte {
-	off := r.CreateContextsOffset()
+	off := int(r.CreateContextsOffset())
 	if off < 88+64 {
 		return nil
 	}
 	off -= 64
-	len := r.CreateContextsLength()
-	return r[off : off+len]
+	return r[off : off+int(r.CreateContextsLength())]
 }
 
 // ----------------------------------------------------------------------------
@@ -1096,7 +1093,7 @@ func (r ReadResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(r) < int(uint32(r.DataOffset())+r.DataLength())-64 {
+	if uint64(len(r))+64 < uint64(r.DataOffset())+uint64(r.DataLength()) {
 		return true
 	}
 
@@ -1124,13 +1121,12 @@ func (r ReadResponseDecoder) DataRemaining() uint32 {
 // }
 
 func (r ReadResponseDecoder) Data() []byte {
-	off := r.DataOffset()
+	off := int(r.DataOffset())
 	if off < 16+64 {
 		return nil
 	}
 	off -= 64
-	len := r.DataLength()
-	return r[off : uint32(off)+len]
+	return r[off : off+int(r.DataLength())]
 }
 
 // ----------------------------------------------------------------------------
@@ -1273,11 +1269,11 @@ func (r IoctlResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(r) < int(r.InputOffset()+r.InputCount())-64 {
+	if uint64(len(r))+64 < uint64(r.InputOffset())+uint64(r.InputCount()) {
 		return true
 	}
 
-	if len(r) < int(r.OutputOffset()+r.OutputCount())-64 {
+	if uint64(len(r))+64 < uint64(r.OutputOffset())+uint64(r.OutputCount()) {
 		return true
 	}
 
@@ -1321,23 +1317,21 @@ func (r IoctlResponseDecoder) Flags() uint32 {
 // }
 
 func (r IoctlResponseDecoder) Input() []byte {
-	off := r.InputOffset()
+	off := int(r.InputOffset())
 	if off < 64+48 {
 		return nil
 	}
 	off -= 64
-	len := r.InputCount()
-	return r[off : off+len]
+	return r[off : off+int(r.InputCount())]
 }
 
 func (r IoctlResponseDecoder) Output() []byte {
-	off := r.OutputOffset()
+	off := int(r.OutputOffset())
 	if off < 64+48 {
 		return nil
 	}
 	off -= 64
-	len := r.OutputCount()
-	return r[off : off+len]
+	return r[off : off+int(r.OutputCount())]
 }
 
 // ----------------------------------------------------------------------------
@@ -1388,7 +1382,7 @@ func (r QueryDirectoryResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(r) < int(uint32(r.OutputBufferOffset())+r.OutputBufferLength())-64 {
+	if uint64(len(r))+64 < uint64(r.OutputBufferOffset())+uint64(r.OutputBufferLength()) {
 		return true
 	}
 
@@ -1412,13 +1406,12 @@ func (r QueryDirectoryResponseDecoder) OutputBufferLength() uint32 {
 // }
 
 func (r QueryDirectoryResponseDecoder) OutputBuffer() []byte {
-	off := r.OutputBufferOffset()
+	off := int(r.OutputBufferOffset())
 	if off < 64+8 {
 		return nil
 	}
 	off -= 64
-	len := r.OutputBufferLength()
-	return r[off : uint32(off)+len]
+	return r[off : off+int(r.OutputBufferLength())]
 }
 
 // ----------------------------------------------------------------------------
@@ -1473,7 +1466,7 @@ func (r QueryInfoResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(r) < int(uint32(r.OutputBufferOffset())+r.OutputBufferLength())-64 {
+	if uint64(len(r))+64 < uint64(r.OutputBufferOffset())+uint64(r.OutputBufferLength()) {
 		return true
 	}
 
@@ -1497,13 +1490,12 @@ func (r QueryInfoResponseDecoder) OutputBufferLength() uint32 {
 // }
 
 func (r QueryInfoResponseDecoder) OutputBuffer() []byte {
-	off := r.OutputBufferOffset()
+	off := int(r.OutputBufferOffset())
 	if off < 64+8 {
 		return nil
 	}
 	off -= 64
-	len := r.OutputBufferLength()
-	return r[off : uint32(off)+len]
+	return r[off : off+int(r.OutputBufferLength())]
 }
 
 // ----------------------------------------------------------------------------

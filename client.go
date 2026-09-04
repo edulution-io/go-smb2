@@ -2079,7 +2079,13 @@ func parseDirectoryEntries(output []byte) (fi []os.FileInfo, err error) {
 			return fi, nil
 		}
 
-		if uint64(next) > uint64(len(output)) {
+		// MS-FSCC 2.4.10: entries do not overlap, so the next one starts at or
+		// past the end of this one. Requiring that, and not just that the
+		// offset stays inside the buffer, is what keeps the walk linear: an
+		// offset pointing back into the entry just decoded would have every
+		// pass re-decode the same name, which is quadratic in the buffer the
+		// server chose to send.
+		if uint64(next) < 64+uint64(info.FileNameLength()) || uint64(next) > uint64(len(output)) {
 			return nil, &InvalidResponseError{"broken query directory response format"}
 		}
 

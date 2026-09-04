@@ -73,3 +73,22 @@ func TestParseDirectoryEntriesRejectsOutOfRangeNextEntryOffset(t *testing.T) {
 		}()
 	}
 }
+
+// NextEntryOffset must also advance past the entry just decoded, not merely
+// stay inside the buffer. Without that, a server can lay out one response so
+// the walk re-reads overlapping bytes as entry after entry: the buffer below
+// is 256 bytes, which holds at most four conforming entries, but stepping 8
+// bytes at a time yields 25 -- and with a large FileNameLength each of those
+// passes re-decodes a name, which is quadratic in the length the server chose.
+func TestParseDirectoryEntriesRejectsNonAdvancingNextEntryOffset(t *testing.T) {
+	output := make([]byte, 256)
+	for off := 0; off+64 <= len(output); off += 8 {
+		binary.LittleEndian.PutUint32(output[off:off+4], 8) // NextEntryOffset
+	}
+	binary.LittleEndian.PutUint32(output[192:196], 0) // terminate the chain
+
+	fi, err := parseDirectoryEntries(output)
+	if err == nil {
+		t.Errorf("parseDirectoryEntries() = %d entries, nil error for a chain stepping 8 bytes through 64-byte entries, want an error", len(fi))
+	}
+}

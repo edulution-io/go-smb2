@@ -65,13 +65,13 @@ func Test(t *testing.T) {
 
 		ccm, err := NewCCMWithNonceAndTagSizes(c, len(ex.Nonce), ex.TagLen)
 		if err != nil {
-			t.Log(err)
+			t.Fatal(err)
 		}
 
 		CipherText := ccm.Seal(nil, ex.Nonce, ex.PlainText, ex.Data)
 
 		if !bytes.Equal(ex.CipherText, CipherText) {
-			t.Log(err)
+			t.Errorf("Seal() = %x, want %x", CipherText, ex.CipherText)
 		}
 
 		PlainText, err := ccm.Open(nil, ex.Nonce, ex.CipherText, ex.Data)
@@ -80,7 +80,41 @@ func Test(t *testing.T) {
 		}
 
 		if !bytes.Equal(ex.PlainText, PlainText) {
-			t.Log(err)
+			t.Errorf("Open() = %x, want %x", PlainText, ex.PlainText)
+		}
+
+		// Every byte of the message is authenticated: a flipped bit in the
+		// ciphertext, the tag, or the associated data has to be rejected.
+		for _, tamper := range []struct {
+			name string
+			ct   []byte
+			data []byte
+		}{
+			{"tag", flipLast(ex.CipherText), ex.Data},
+			{"ciphertext", flipFirst(ex.CipherText), ex.Data},
+			{"associated data", ex.CipherText, flipFirst(ex.Data)},
+		} {
+			if tamper.name == "associated data" && len(ex.Data) == 0 {
+				continue
+			}
+			if _, err := ccm.Open(nil, ex.Nonce, tamper.ct, tamper.data); err == nil {
+				t.Errorf("Open() accepted a message with a flipped bit in the %s", tamper.name)
+			}
 		}
 	}
+}
+
+func flipFirst(b []byte) []byte {
+	if len(b) == 0 {
+		return b
+	}
+	c := append([]byte(nil), b...)
+	c[0] ^= 1
+	return c
+}
+
+func flipLast(b []byte) []byte {
+	c := append([]byte(nil), b...)
+	c[len(c)-1] ^= 1
+	return c
 }

@@ -1,7 +1,7 @@
 package ntlm
 
 import (
-	"bytes"
+	"crypto/hmac"
 	"crypto/rc4"
 	"errors"
 
@@ -82,13 +82,13 @@ func (s *Session) CheckSum(sum, plaintext []byte, seqNum uint32) (bool, uint32) 
 
 	if s.isClientSide {
 		ret, seqNum := mac(nil, s.negotiateFlags, s.serverHandle, s.serverSigningKey, seqNum, plaintext)
-		if !bytes.Equal(sum, ret) {
+		if !hmac.Equal(sum, ret) {
 			return false, 0
 		}
 		return true, seqNum
 	}
 	ret, seqNum := mac(nil, s.negotiateFlags, s.clientHandle, s.clientSigningKey, seqNum, plaintext)
-	if !bytes.Equal(sum, ret) {
+	if !hmac.Equal(sum, ret) {
 		return false, 0
 	}
 	return true, seqNum
@@ -133,7 +133,7 @@ func (s *Session) Unseal(dst, ciphertext []byte, seqNum uint32) ([]byte, uint32,
 		} else {
 			sum, seqNum = mac(nil, s.negotiateFlags, s.clientHandle, s.clientSigningKey, seqNum, plaintext)
 		}
-		if !bytes.Equal(ciphertext[:16], sum) {
+		if !hmac.Equal(ciphertext[:16], sum) {
 			return nil, 0, errors.New("signature mismatch")
 		}
 	case s.negotiateFlags&NTLMSSP_NEGOTIATE_SIGN != 0:
@@ -146,7 +146,7 @@ func (s *Session) Unseal(dst, ciphertext []byte, seqNum uint32) ([]byte, uint32,
 		} else {
 			sum, seqNum = mac(nil, s.negotiateFlags, s.clientHandle, s.clientSigningKey, seqNum, plaintext)
 		}
-		if !bytes.Equal(ciphertext[:16], sum) {
+		if !hmac.Equal(ciphertext[:16], sum) {
 			return nil, 0, errors.New("signature mismatch")
 		}
 	default:

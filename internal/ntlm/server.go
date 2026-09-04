@@ -199,7 +199,7 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 		clientChallenge := ntlmv2ClientChallenge[16:24]
 		targetInfo := ntlmv2ClientChallenge[28:]
 		encodeNtlmv2Response(expectedNtChallengeResponse, h, serverChallenge, clientChallenge, timeStamp, bytesEncoder(targetInfo))
-		if !bytes.Equal(ntChallengeResponse, expectedNtChallengeResponse) {
+		if !hmac.Equal(ntChallengeResponse, expectedNtChallengeResponse) {
 			return errors.New("login failure")
 		}
 
@@ -241,7 +241,7 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 				h.Write(s.nmsg)
 				h.Write(s.cmsg)
 				h.Write(amsg)
-				if !bytes.Equal(MIC, h.Sum(nil)) {
+				if !hmac.Equal(MIC, h.Sum(nil)) {
 					return errors.New("login failure")
 				}
 			}

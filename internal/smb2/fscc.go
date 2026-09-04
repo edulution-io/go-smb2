@@ -162,7 +162,7 @@ func (c SrvRequestResumeKeyResponseDecoder) ContextLength() uint32 {
 }
 
 func (c SrvRequestResumeKeyResponseDecoder) Context() []byte {
-	return c[28 : 28+c.ContextLength()]
+	return c[28 : 28+uint64(c.ContextLength())]
 }
 
 type SrvCopychunkCopy struct {
@@ -495,7 +495,7 @@ func (c FileQuotaInformationDecoder) QuotaLimit() int64 {
 }
 
 func (c FileQuotaInformationDecoder) Sid() SidDecoder {
-	return SidDecoder(c[40 : 40+c.SidLength()])
+	return SidDecoder(c[40 : 40+uint64(c.SidLength())])
 }
 
 type FileEndOfFileInformationEncoder struct {

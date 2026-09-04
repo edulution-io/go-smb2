@@ -2,6 +2,7 @@ package smb2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -1773,9 +1774,170 @@ func copyBuffer(r io.Reader, w io.Writer, buf []byte) (n int64, err error) {
 	return
 }
 
+// copychunkLimits bound one FSCTL_SRV_COPYCHUNK request: how many chunks it may
+// carry, how long each of them may be, and how much they may add up to.
+type copychunkLimits struct {
+	chunks    uint32
+	chunkSize uint32
+	totalSize uint32
+}
+
+// defaultCopychunkLimits are what MS-SMB2 3.3.5.15.6 tells a client to assume
+// before the server has said otherwise. A server wanting less rejects the
+// request and returns its own; see copychunkLimitsFrom.
+var defaultCopychunkLimits = copychunkLimits{
+	chunks:    16,
+	chunkSize: 1024 * 1024,
+	totalSize: 16 * 1024 * 1024,
+}
+
+// usable reports whether the limits leave room for any progress at all. A zero
+// in any of the three would plan an empty request forever.
+func (l copychunkLimits) usable() bool {
+	return l.chunks > 0 && l.chunkSize > 0 && l.totalSize > 0
+}
+
+// copychunkLimitsFrom reads the limits a server attached to a rejected request.
+// The SRV_COPYCHUNK_RESPONSE that comes back with STATUS_INVALID_PARAMETER
+// carries maxima in the fields that otherwise count what was written
+// (MS-SMB2 2.2.32.1).
+func copychunkLimitsFrom(output []byte) (copychunkLimits, bool) {
+	c := SrvCopychunkResponseDecoder(output)
+	if c.IsInvalid() {
+		return copychunkLimits{}, false
+	}
+
+	l := copychunkLimits{
+		chunks:    c.ChunksWritten(),
+		chunkSize: c.ChunksBytesWritten(),
+		totalSize: c.TotalBytesWritten(),
+	}
+	return l, l.usable()
+}
+
+// planCopychunks lays out one request's worth of chunks, copying the bytes at
+// srcOff to dstOff, and returns how many bytes they cover.
+//
+// Both offsets are absolute and neither is remembered, which is why the walk
+// across requests is copychunkPlanner's job and not this function's.
+func planCopychunks(srcOff, dstOff, remains int64, l copychunkLimits) ([]*SrvCopychunk, int64) {
+	budget := remains
+	if int64(l.totalSize) < budget {
+		budget = int64(l.totalSize)
+	}
+
+	var (
+		chunks  []*SrvCopychunk
+		planned int64
+	)
+	for planned < budget && uint32(len(chunks)) < l.chunks {
+		length := budget - planned
+		if int64(l.chunkSize) < length {
+			length = int64(l.chunkSize)
+		}
+		chunks = append(chunks, &SrvCopychunk{
+			SourceOffset: srcOff + planned,
+			TargetOffset: dstOff + planned,
+			Length:       uint32(length),
+		})
+		planned += length
+	}
+
+	return chunks, planned
+}
+
+// copychunkPlanner walks one copy across as many FSCTL_SRV_COPYCHUNK requests
+// as the server's limits make necessary. It is what remembers where the last
+// request got to -- a plan that forgets that restarts at the top of the file on
+// its second request, and the byte count still comes out right.
+type copychunkPlanner struct {
+	srcOff  int64 // where the copy started reading
+	dstOff  int64 // where it started writing
+	copied  int64 // bytes the server has reported written
+	remains int64 // bytes not yet accounted for
+	limits  copychunkLimits
+}
+
+func newCopychunkPlanner(srcOff, dstOff, size int64) *copychunkPlanner {
+	return &copychunkPlanner{
+		srcOff:  srcOff,
+		dstOff:  dstOff,
+		remains: size,
+		limits:  defaultCopychunkLimits,
+	}
+}
+
+// done reports whether every byte has been accounted for.
+func (p *copychunkPlanner) done() bool { return p.remains <= 0 }
+
+// next lays out the request to send now, and how many bytes it covers.
+func (p *copychunkPlanner) next() ([]*SrvCopychunk, int64) {
+	return planCopychunks(p.srcOff+p.copied, p.dstOff+p.copied, p.remains, p.limits)
+}
+
+// narrow re-chunks what is left against the limits a server returned.
+func (p *copychunkPlanner) narrow(l copychunkLimits) { p.limits = l }
+
+// advance records what the server reported writing for the request next laid
+// out. The server may write less than was asked for, but zero would not
+// terminate and more than was asked for is not a number this can copy past.
+func (p *copychunkPlanner) advance(written, planned int64) error {
+	if written <= 0 || written > planned {
+		return &InvalidResponseError{fmt.Sprintf("srv copy chunk reported %d of %d requested bytes", written, planned)}
+	}
+
+	p.copied += written
+	p.remains -= written
+	return nil
+}
+
+// copychunkUnsupported reports whether err says the backend cannot serve a
+// copychunk at all, as opposed to failing this particular one.
+func copychunkUnsupported(err error) bool {
+	rerr, ok := err.(*ResponseError)
+	if !ok {
+		return false
+	}
+	switch NtStatus(rerr.Code) {
+	case STATUS_NOT_SUPPORTED, STATUS_INVALID_DEVICE_REQUEST:
+		return true
+	}
+	return false
+}
+
+// rejectedForLimits reports whether err is the rejection that carries the
+// server's own limits.
+func rejectedForLimits(err error) bool {
+	rerr, ok := err.(*ResponseError)
+	return ok && NtStatus(rerr.Code) == STATUS_INVALID_PARAMETER
+}
+
+// sameSession reports whether two handles are eligible for a server-side copy
+// between them. The resume key is scoped to the session rather than to the tree
+// connect, so two shares mounted on one session qualify.
+func sameSession(a, b *File) bool {
+	if a == nil || b == nil || a.fs == nil || b.fs == nil {
+		return false
+	}
+	if a.fs.treeConn == nil || b.fs.treeConn == nil {
+		return false
+	}
+	return a.fs.session == b.fs.session
+}
+
+// copyTo copies the rest of f into wf without the bytes passing through this
+// process, and reports whether the pair supports that at all.
+//
+// supported == false leaves both handles exactly where the caller left them, so
+// the same bytes can be streamed instead. Any other error may leave wf
+// partially written.
 func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
 	f.m.Lock()
 	defer f.m.Unlock()
+
+	fail := func(err error) (bool, int64, error) {
+		return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: err}
+	}
 
 	req := &IoctlRequest{
 		CtlCode:           FSCTL_SRV_REQUEST_RESUME_KEY,
@@ -1788,82 +1950,52 @@ func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
 
 	output, err := f.ioctl(req)
 	if err != nil {
-		if rerr, ok := err.(*ResponseError); ok && NtStatus(rerr.Code) == STATUS_NOT_SUPPORTED {
+		if copychunkUnsupported(err) {
 			return false, -1, nil
 		}
 
-		return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: err}
-
+		return fail(err)
 	}
 
 	sr := SrvRequestResumeKeyResponseDecoder(output)
 	if sr.IsInvalid() {
-		return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: &InvalidResponseError{"broken srv request resume key response format"}}
+		return fail(&InvalidResponseError{"broken srv request resume key response format"})
 	}
 
 	off, err := f.seek(0, io.SeekCurrent)
 	if err != nil {
-		return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: err}
+		return fail(err)
 	}
 
 	end, err := f.seek(0, io.SeekEnd)
 	if err != nil {
-		return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: err}
+		return fail(err)
 	}
 
 	woff, err := wf.seek(0, io.SeekCurrent)
 	if err != nil {
-		return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: err}
+		return fail(err)
 	}
 
-	var chunks []*SrvCopychunk
+	// What is left of f from where the caller had it, not the whole file: a
+	// partially read handle copies the rest, the way streaming it would.
+	remains := end - off
+	if remains <= 0 {
+		// A request carrying no chunks is how MS-SMB2 3.3.5.15.6 says to ask a
+		// server for its limits, and it is answered STATUS_INVALID_PARAMETER --
+		// so an empty file must not be sent as one.
+		return true, 0, nil
+	}
 
-	remains := end
+	scc := &SrvCopychunkCopy{}
+	copy(scc.SourceKey[:], sr.ResumeKey())
 
-	for {
-		const maxChunkSize = 1024 * 1024
-		const maxTotalSize = 16 * 1024 * 1024
-		// https://msdn.microsoft.com/en-us/library/cc512134(v=vs.85).aspx
+	plan := newCopychunkPlanner(off, woff, remains)
+	renegotiated := false
 
-		if remains < maxTotalSize {
-			nchunks := remains / maxChunkSize
-
-			chunks = make([]*SrvCopychunk, nchunks, nchunks+1)
-			for i := range chunks {
-				chunks[i] = &SrvCopychunk{
-					SourceOffset: off + int64(i)*maxChunkSize,
-					TargetOffset: woff + int64(i)*maxChunkSize,
-					Length:       maxChunkSize,
-				}
-			}
-
-			remains %= maxChunkSize
-			if remains != 0 {
-				chunks = append(chunks, &SrvCopychunk{
-					SourceOffset: off + int64(nchunks)*maxChunkSize,
-					TargetOffset: woff + int64(nchunks)*maxChunkSize,
-					Length:       uint32(remains),
-				})
-				remains = 0
-			}
-		} else {
-			chunks = make([]*SrvCopychunk, 16)
-			for i := range chunks {
-				chunks[i] = &SrvCopychunk{
-					SourceOffset: off + int64(i)*maxChunkSize,
-					TargetOffset: woff + int64(i)*maxChunkSize,
-					Length:       maxChunkSize,
-				}
-			}
-
-			remains -= maxTotalSize
-		}
-
-		scc := &SrvCopychunkCopy{
-			Chunks: chunks,
-		}
-
-		copy(scc.SourceKey[:], sr.ResumeKey())
+	for !plan.done() {
+		chunks, planned := plan.next()
+		scc.Chunks = chunks
 
 		cReq := &IoctlRequest{
 			CtlCode:           FSCTL_SRV_COPYCHUNK,
@@ -1875,29 +2007,85 @@ func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
 			Input:             scc,
 		}
 
-		output, err = wf.ioctl(cReq)
+		output, err := wf.ioctl(cReq)
 		if err != nil {
-			return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: err}
+			// A server that wants smaller requests says so by rejecting one and
+			// returning its limits. Re-chunking against them is worth one retry;
+			// a second would let a server that keeps rejecting spin here, and the
+			// limits are a property of the server, not of the request.
+			if !renegotiated && rejectedForLimits(err) {
+				if narrowed, ok := copychunkLimitsFrom(output); ok {
+					renegotiated = true
+					plan.narrow(narrowed)
+					continue
+				}
+			}
+
+			if plan.copied == 0 && copychunkUnsupported(err) {
+				// Nothing was written, so both handles can go back to where the
+				// caller left them and the copy can be streamed instead.
+				f.seek(off, io.SeekStart)
+				wf.seek(woff, io.SeekStart)
+				return false, -1, nil
+			}
+
+			return fail(err)
 		}
 
 		c := SrvCopychunkResponseDecoder(output)
 		if c.IsInvalid() {
-			return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: &InvalidResponseError{"broken srv copy chunk response format"}}
+			return fail(&InvalidResponseError{"broken srv copy chunk response format"})
 		}
 
-		n += int64(c.TotalBytesWritten())
-
-		if remains == 0 {
-			return true, n, nil
+		if err := plan.advance(int64(c.TotalBytesWritten()), planned); err != nil {
+			return fail(err)
 		}
 	}
+
+	// A streamed copy leaves the destination advanced by what it received; the
+	// ioctl writes at an offset and moves nothing.
+	if _, err := wf.seek(woff+plan.copied, io.SeekStart); err != nil {
+		return fail(err)
+	}
+
+	return true, plan.copied, nil
+}
+
+// ErrServerSideCopyUnsupported reports that a pair of handles cannot be copied
+// by the server: they are not on one session, or the backend rejects the ioctl.
+// Nothing was copied and neither handle moved.
+var ErrServerSideCopyUnsupported = errors.New("smb2: server-side copy is not supported for these files")
+
+// ServerSideCopy copies src, from its current offset to its end, into dst at
+// dst's current offset, without the bytes travelling through this process.
+//
+// It leaves src at EOF and dst advanced by what was written, as io.Copy would.
+// ErrServerSideCopyUnsupported means the caller can stream the same bytes
+// instead; on any other error dst may be partially written.
+//
+// ReadFrom and WriteTo do this on their own for an *File argument. This is for
+// a caller holding the two handles inside wrappers of its own, where neither of
+// those can recognise the pair.
+func ServerSideCopy(dst, src *File) (int64, error) {
+	if !sameSession(src, dst) {
+		return 0, ErrServerSideCopyUnsupported
+	}
+
+	supported, n, err := src.copyTo(dst)
+	if !supported {
+		return 0, ErrServerSideCopyUnsupported
+	}
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // ReadFrom implements io.ReadFrom.
-// If r is *File on the same *Share as f, it invokes server-side copy.
+// If r is an *File on the same session as f, it invokes server-side copy.
 func (f *File) ReadFrom(r io.Reader) (n int64, err error) {
 	rf, ok := r.(*File)
-	if ok && rf.fs == f.fs {
+	if ok && sameSession(rf, f) {
 		if supported, n, err := rf.copyTo(f); supported {
 			return n, err
 		}
@@ -1914,10 +2102,10 @@ func (f *File) ReadFrom(r io.Reader) (n int64, err error) {
 }
 
 // WriteTo implements io.WriteTo.
-// If w is *File on the same *Share as f, it invokes server-side copy.
+// If w is an *File on the same session as f, it invokes server-side copy.
 func (f *File) WriteTo(w io.Writer) (n int64, err error) {
 	wf, ok := w.(*File)
-	if ok && wf.fs == f.fs {
+	if ok && sameSession(f, wf) {
 		if supported, n, err := f.copyTo(wf); supported {
 			return n, err
 		}

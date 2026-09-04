@@ -2074,7 +2074,7 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 			return fi, nil
 		}
 
-		// Server-controlled; slicing past the end would panic the receiver.
+		// Server-controlled; slicing past the end would panic the caller.
 		if uint64(next) >= uint64(len(output)) {
 			return nil, &InvalidResponseError{"broken query directory response format"}
 		}

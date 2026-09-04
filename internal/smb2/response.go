@@ -1082,7 +1082,7 @@ func (c *ReadResponse) Encode(pkt []byte) {
 
 	res := pkt[64:]
 	le.PutUint16(res[:2], 17) // StructureSize
-	res[2] = 16               // DataOffset
+	res[2] = 16 + 64          // DataOffset, from the start of the header
 	copy(res[16:], c.Data)
 	le.PutUint32(res[4:8], uint32(len(c.Data))) // DataLength
 	le.PutUint32(res[8:12], c.DataRemaining)

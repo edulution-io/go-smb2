@@ -227,3 +227,22 @@ func TestQueryInfoResponseDecoderBounds(t *testing.T) {
 		mk("OutputBufferLength wraps the sum to 71", true, queryInfoResponse(72, 72, 0xFFFFFFFF)),
 	})
 }
+
+// The encoder wrote DataOffset body-relative (16) while every other encoder
+// and the decoder use header-relative offsets, so a response this package
+// produced decoded to nil data. Encode and decode have to agree.
+func TestReadResponseRoundTrip(t *testing.T) {
+	want := []byte("sixteen bytes!!!")
+	res := &ReadResponse{Data: want}
+	pkt := make([]byte, res.Size())
+	res.Encode(pkt)
+
+	d := ReadResponseDecoder(pkt[64:])
+	if d.IsInvalid() {
+		t.Fatalf("IsInvalid() = true for a response Encode produced (DataOffset=%d, DataLength=%d)",
+			d.DataOffset(), d.DataLength())
+	}
+	if got := d.Data(); string(got) != string(want) {
+		t.Errorf("Data() = %q, want %q", got, want)
+	}
+}

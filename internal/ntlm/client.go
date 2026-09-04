@@ -89,11 +89,14 @@ func (c *Client) Authenticate(cmsg []byte) (amsg []byte, err error) {
 	if targetNameMaxLen < targetNameLen {
 		return nil, errors.New("invalid target name format")
 	}
-	targetNameBufferOffset := le.Uint32(cmsg[16:20]) // cmsg.TargetNameBufferOffset
-	if len(cmsg) < int(targetNameBufferOffset+uint32(targetNameLen)) {
+	// The sum is taken in uint64: both fields are server-controlled, and in
+	// uint32 an offset near the type maximum wraps it below len(cmsg), which
+	// clears the guard for a slice that is out of range.
+	targetNameBufferOffset := uint64(le.Uint32(cmsg[16:20])) // cmsg.TargetNameBufferOffset
+	if uint64(len(cmsg)) < targetNameBufferOffset+uint64(targetNameLen) {
 		return nil, errors.New("invalid target name format")
 	}
-	targetName := cmsg[targetNameBufferOffset : targetNameBufferOffset+uint32(targetNameLen)] // cmsg.TargetName
+	targetName := cmsg[targetNameBufferOffset : targetNameBufferOffset+uint64(targetNameLen)] // cmsg.TargetName
 
 	if flags&NTLMSSP_NEGOTIATE_TARGET_INFO == 0 {
 		return nil, errors.New("invalid negotiate flags")
@@ -104,11 +107,11 @@ func (c *Client) Authenticate(cmsg []byte) (amsg []byte, err error) {
 	if targetInfoMaxLen < targetInfoLen {
 		return nil, errors.New("invalid target info format")
 	}
-	targetInfoBufferOffset := le.Uint32(cmsg[44:48]) // cmsg.TargetInfoBufferOffset
-	if len(cmsg) < int(targetInfoBufferOffset+uint32(targetInfoLen)) {
+	targetInfoBufferOffset := uint64(le.Uint32(cmsg[44:48])) // cmsg.TargetInfoBufferOffset
+	if uint64(len(cmsg)) < targetInfoBufferOffset+uint64(targetInfoLen) {
 		return nil, errors.New("invalid target info format")
 	}
-	targetInfo := cmsg[targetInfoBufferOffset : targetInfoBufferOffset+uint32(targetInfoLen)] // cmsg.TargetInfo
+	targetInfo := cmsg[targetInfoBufferOffset : targetInfoBufferOffset+uint64(targetInfoLen)] // cmsg.TargetInfo
 	info := newTargetInfoEncoder(targetInfo, utf16le.EncodeStringToBytes(c.TargetSPN))
 	if info == nil {
 		return nil, errors.New("invalid target info format")

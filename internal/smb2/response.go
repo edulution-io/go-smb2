@@ -392,6 +392,9 @@ func (c *NegotiateResponse) Encode(pkt []byte) {
 
 type NegotiateResponseDecoder []byte
 
+// IsInvalid reports whether the buffer does not hold a decodable response.
+// Offsets are counted from the start of the SMB2 header, so the buffer covers
+// them from 64 on; the sums are taken in uint64 because the field widths wrap.
 func (r NegotiateResponseDecoder) IsInvalid() bool {
 	if len(r) < 64 {
 		return true
@@ -401,7 +404,7 @@ func (r NegotiateResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(r) < int(r.SecurityBufferOffset()+r.SecurityBufferLength())-64 {
+	if uint64(len(r))+64 < uint64(r.SecurityBufferOffset())+uint64(r.SecurityBufferLength()) {
 		return true
 	}
 
@@ -412,7 +415,7 @@ func (r NegotiateResponseDecoder) IsInvalid() bool {
 			return true
 		}
 
-		if len(r) < int(noff)-64 {
+		if uint64(len(r))+64 < uint64(noff) {
 			return true
 		}
 	}
@@ -473,12 +476,12 @@ func (r NegotiateResponseDecoder) SecurityBufferLength() uint16 {
 // }
 
 func (r NegotiateResponseDecoder) SecurityBuffer() []byte {
-	off := r.SecurityBufferOffset()
+	off := uint64(r.SecurityBufferOffset())
 	if off < 64+64 {
 		return nil
 	}
 	off -= 64
-	len := r.SecurityBufferLength()
+	len := uint64(r.SecurityBufferLength())
 	return r[off : off+len]
 }
 
@@ -542,6 +545,9 @@ func (c *SessionSetupResponse) Encode(pkt []byte) {
 
 type SessionSetupResponseDecoder []byte
 
+// IsInvalid reports whether the buffer does not hold a decodable response. Same
+// wrapping sum as NegotiateResponseDecoder.IsInvalid, on the response that
+// carries the GSS token.
 func (r SessionSetupResponseDecoder) IsInvalid() bool {
 	if len(r) < 8 {
 		return true
@@ -551,7 +557,7 @@ func (r SessionSetupResponseDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(r) < int(r.SecurityBufferOffset()+r.SecurityBufferLength())-64 {
+	if uint64(len(r))+64 < uint64(r.SecurityBufferOffset())+uint64(r.SecurityBufferLength()) {
 		return true
 	}
 
@@ -579,12 +585,12 @@ func (r SessionSetupResponseDecoder) SecurityBufferLength() uint16 {
 // }
 
 func (r SessionSetupResponseDecoder) SecurityBuffer() []byte {
-	off := r.SecurityBufferOffset()
+	off := uint64(r.SecurityBufferOffset())
 	if off < 8+64 {
 		return nil
 	}
 	off -= 64
-	len := r.SecurityBufferLength()
+	len := uint64(r.SecurityBufferLength())
 	return r[off : off+len]
 }
 

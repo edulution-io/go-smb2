@@ -2268,10 +2268,9 @@ func parseDirectoryEntries(output []byte) (fi []os.FileInfo, err error) {
 		}
 
 		// Server-controlled; slicing past the end would panic the caller.
-		// MS-FSCC 2.4.10 also has entries not overlapping, so the next one
-		// starts at or past the end of this one -- requiring that is what
-		// keeps the walk linear, since an offset pointing back into the entry
-		// just decoded would have every pass re-decode the same name.
+		// The 8-byte alignment MS-FSCC 2.4.10 requires also puts the next
+		// entry at or past the end of this one, so an offset that does not
+		// advance is malformed.
 		if uint64(next) < 64+uint64(info.FileNameLength()) || uint64(next) >= uint64(len(output)) {
 			return nil, &InvalidResponseError{"broken query directory response format"}
 		}

@@ -2046,8 +2046,13 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 		return nil, &InvalidResponseError{"broken query directory response format"}
 	}
 
-	output := r.OutputBuffer()
+	return parseDirectoryEntries(r.OutputBuffer())
+}
 
+// parseDirectoryEntries walks the FILE_DIRECTORY_INFORMATION chain of a
+// QUERY_DIRECTORY response. NextEntryOffset is server-controlled and is
+// bounds checked before it advances the buffer.
+func parseDirectoryEntries(output []byte) (fi []os.FileInfo, err error) {
 	for {
 		info := FileDirectoryInformationDecoder(output)
 		if info.IsInvalid() {
@@ -2072,6 +2077,10 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 		next := info.NextEntryOffset()
 		if next == 0 {
 			return fi, nil
+		}
+
+		if uint64(next) > uint64(len(output)) {
+			return nil, &InvalidResponseError{"broken query directory response format"}
 		}
 
 		output = output[next:]

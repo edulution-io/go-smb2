@@ -308,8 +308,17 @@ const (
 
 type FileDirectoryInformationDecoder []byte
 
+// IsInvalid reports whether the buffer does not hold a decodable entry. The
+// fixed fields are established before FileNameLength is read out of c[60:64],
+// and the total is compared in uint64 because 64+FileNameLength() wraps in
+// uint32 arithmetic -- the guard would then clear a length FileName slices
+// past the end with.
 func (c FileDirectoryInformationDecoder) IsInvalid() bool {
-	return len(c) < int(64+c.FileNameLength())
+	if len(c) < 64 {
+		return true
+	}
+
+	return uint64(len(c)) < 64+uint64(c.FileNameLength())
 }
 
 func (c FileDirectoryInformationDecoder) NextEntryOffset() uint32 {
@@ -353,7 +362,7 @@ func (c FileDirectoryInformationDecoder) FileNameLength() uint32 {
 }
 
 func (c FileDirectoryInformationDecoder) FileName() string {
-	return utf16le.DecodeToString(c[64 : 64+c.FileNameLength()])
+	return utf16le.DecodeToString(c[64 : 64+uint64(c.FileNameLength())])
 }
 
 type FileRenameInformationType2Encoder struct {
@@ -700,7 +709,7 @@ func (c FileNameInformationDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(c) < int(4+c.FileNameLength()) {
+	if uint64(len(c)) < 4+uint64(c.FileNameLength()) {
 		return true
 	}
 
@@ -712,5 +721,5 @@ func (c FileNameInformationDecoder) FileNameLength() uint32 {
 }
 
 func (c FileNameInformationDecoder) FileName() string {
-	return utf16le.DecodeToString(c[4 : 4+c.FileNameLength()])
+	return utf16le.DecodeToString(c[4 : 4+uint64(c.FileNameLength())])
 }

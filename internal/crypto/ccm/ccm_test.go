@@ -65,7 +65,7 @@ func Test(t *testing.T) {
 
 		ccm, err := NewCCMWithNonceAndTagSizes(c, len(ex.Nonce), ex.TagLen)
 		if err != nil {
-			t.Log(err)
+			t.Fatal(err)
 		}
 
 		CipherText := ccm.Seal(nil, ex.Nonce, ex.PlainText, ex.Data)

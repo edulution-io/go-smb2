@@ -127,15 +127,13 @@ func (c SymbolicLinkReparseDataBufferDecoder) PathBuffer() []byte {
 }
 
 func (c SymbolicLinkReparseDataBufferDecoder) SubstituteName() string {
-	off := c.SubstituteNameOffset()
-	len := c.SubstituteNameLength()
-	return utf16le.DecodeToString(c.PathBuffer()[off : off+len])
+	off := int(c.SubstituteNameOffset())
+	return utf16le.DecodeToString(c.PathBuffer()[off : off+int(c.SubstituteNameLength())])
 }
 
 func (c SymbolicLinkReparseDataBufferDecoder) PrintName() string {
-	off := c.PrintNameOffset()
-	len := c.PrintNameLength()
-	return utf16le.DecodeToString(c.PathBuffer()[off : off+len])
+	off := int(c.PrintNameOffset())
+	return utf16le.DecodeToString(c.PathBuffer()[off : off+int(c.PrintNameLength())])
 }
 
 type SrvRequestResumeKeyResponseDecoder []byte
@@ -309,7 +307,11 @@ const (
 type FileDirectoryInformationDecoder []byte
 
 func (c FileDirectoryInformationDecoder) IsInvalid() bool {
-	return len(c) < int(64+c.FileNameLength())
+	if len(c) < 64 {
+		return true
+	}
+
+	return uint64(len(c)) < 64+uint64(c.FileNameLength())
 }
 
 func (c FileDirectoryInformationDecoder) NextEntryOffset() uint32 {
@@ -353,7 +355,7 @@ func (c FileDirectoryInformationDecoder) FileNameLength() uint32 {
 }
 
 func (c FileDirectoryInformationDecoder) FileName() string {
-	return utf16le.DecodeToString(c[64 : 64+c.FileNameLength()])
+	return utf16le.DecodeToString(c[64 : 64+int(c.FileNameLength())])
 }
 
 type FileRenameInformationType2Encoder struct {
@@ -700,7 +702,7 @@ func (c FileNameInformationDecoder) IsInvalid() bool {
 		return true
 	}
 
-	if len(c) < int(4+c.FileNameLength()) {
+	if uint64(len(c)) < 4+uint64(c.FileNameLength()) {
 		return true
 	}
 
@@ -712,5 +714,5 @@ func (c FileNameInformationDecoder) FileNameLength() uint32 {
 }
 
 func (c FileNameInformationDecoder) FileName() string {
-	return utf16le.DecodeToString(c[4 : 4+c.FileNameLength()])
+	return utf16le.DecodeToString(c[4 : 4+int(c.FileNameLength())])
 }

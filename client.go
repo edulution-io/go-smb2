@@ -2234,8 +2234,13 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 		return nil, &InvalidResponseError{"broken query directory response format"}
 	}
 
-	output := r.OutputBuffer()
+	return parseDirectoryEntries(r.OutputBuffer())
+}
 
+// parseDirectoryEntries walks the FILE_DIRECTORY_INFORMATION chain of a
+// QUERY_DIRECTORY response. Split out of readdir so the bounds check on the
+// server-controlled NextEntryOffset can be tested without a server.
+func parseDirectoryEntries(output []byte) (fi []os.FileInfo, err error) {
 	for {
 		info := FileDirectoryInformationDecoder(output)
 		if info.IsInvalid() {
@@ -2263,7 +2268,11 @@ func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {
 		}
 
 		// Server-controlled; slicing past the end would panic the caller.
-		if uint64(next) >= uint64(len(output)) {
+		// MS-FSCC 2.4.10 also has entries not overlapping, so the next one
+		// starts at or past the end of this one -- requiring that is what
+		// keeps the walk linear, since an offset pointing back into the entry
+		// just decoded would have every pass re-decode the same name.
+		if uint64(next) < 64+uint64(info.FileNameLength()) || uint64(next) >= uint64(len(output)) {
 			return nil, &InvalidResponseError{"broken query directory response format"}
 		}
 

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	. "github.com/edulution-io/go-smb2/internal/erref"
@@ -261,7 +262,7 @@ func (fs *Share) newFile(r CreateResponseDecoder, name string) *File {
 		FileName:       base(name),
 	}
 
-	f := &File{fs: fs, fd: fd, name: name, fileStat: fileStat}
+	f := &File{fs: fs, fd: fd, name: name, fileStat: fileStat, id: fileSeq.Add(1)}
 
 	runtime.SetFinalizer(f, (*File).close)
 
@@ -1086,8 +1087,14 @@ type File struct {
 
 	offset int64
 
+	// id orders the offset locks when a copy holds two handles; see
+	// lockOffsets. newFile assigns it, so no two handles share one.
+	id uint64
+
 	m sync.Mutex
 }
+
+var fileSeq atomic.Uint64
 
 func (f *File) Close() error {
 	if f == nil {
@@ -1797,6 +1804,20 @@ func (l copychunkLimits) usable() bool {
 	return l.chunks > 0 && l.chunkSize > 0 && l.totalSize > 0
 }
 
+// clamp bounds the limits to the descriptors one request can carry. The count
+// is server-controlled and reaches planCopychunks before ioctl can measure the
+// request: an advertised 0xFFFFFFFF with a one-byte chunk size would size the
+// allocation by the length of the copy rather than by the protocol.
+func (l copychunkLimits) clamp(maxChunks uint32) copychunkLimits {
+	if maxChunks == 0 {
+		maxChunks = 1
+	}
+	if l.chunks > maxChunks {
+		l.chunks = maxChunks
+	}
+	return l
+}
+
 // copychunkLimitsFrom reads the limits a server attached to a rejected request.
 // The SRV_COPYCHUNK_RESPONSE that comes back with STATUS_INVALID_PARAMETER
 // carries maxima in the fields that otherwise count what was written
@@ -1856,14 +1877,17 @@ type copychunkPlanner struct {
 	copied  int64 // bytes the server has reported written
 	remains int64 // bytes not yet accounted for
 	limits  copychunkLimits
+
+	maxChunks uint32 // descriptors one request can carry
 }
 
-func newCopychunkPlanner(srcOff, dstOff, size int64) *copychunkPlanner {
+func newCopychunkPlanner(srcOff, dstOff, size int64, maxChunks uint32) *copychunkPlanner {
 	return &copychunkPlanner{
-		srcOff:  srcOff,
-		dstOff:  dstOff,
-		remains: size,
-		limits:  defaultCopychunkLimits,
+		srcOff:    srcOff,
+		dstOff:    dstOff,
+		remains:   size,
+		limits:    defaultCopychunkLimits.clamp(maxChunks),
+		maxChunks: maxChunks,
 	}
 }
 
@@ -1875,8 +1899,9 @@ func (p *copychunkPlanner) next() ([]*SrvCopychunk, int64) {
 	return planCopychunks(p.srcOff+p.copied, p.dstOff+p.copied, p.remains, p.limits)
 }
 
-// narrow re-chunks what is left against the limits a server returned.
-func (p *copychunkPlanner) narrow(l copychunkLimits) { p.limits = l }
+// narrow re-chunks what is left against the limits a server returned, bounded
+// by what this client can send.
+func (p *copychunkPlanner) narrow(l copychunkLimits) { p.limits = l.clamp(p.maxChunks) }
 
 // advance records what the server reported writing for the request next laid
 // out. The server may write less than was asked for, but zero would not
@@ -1889,6 +1914,17 @@ func (p *copychunkPlanner) advance(written, planned int64) error {
 	p.copied += written
 	p.remains -= written
 	return nil
+}
+
+// maxCopychunks is how many chunk descriptors one request can carry: an
+// SRV_COPYCHUNK_COPY is a 32-byte header and 24 bytes per descriptor, and
+// ioctl refuses a payload past the negotiated transaction size.
+func (f *File) maxCopychunks() uint32 {
+	room := (f.maxTransactSize() - 32) / 24
+	if room < 1 {
+		return 1
+	}
+	return uint32(room)
 }
 
 // copychunkUnsupported reports whether err says the backend cannot serve a
@@ -1925,6 +1961,34 @@ func sameSession(a, b *File) bool {
 	return a.fs.session == b.fs.session
 }
 
+// lockOffsets locks the offsets of both handles a copy moves and returns the
+// release. Both are mutated -- the source is seeked to EOF, the destination is
+// left where the copy ended -- and File's offset is only ever touched under its
+// own lock.
+//
+// The order is by id rather than by argument, so two copies running in opposite
+// directions cannot each hold the lock the other wants. Copying a handle onto
+// itself is one offset and one lock; taking it twice would deadlock on a
+// sync.Mutex.
+func lockOffsets(a, b *File) func() {
+	if a == b {
+		a.m.Lock()
+		return a.m.Unlock
+	}
+
+	first, second := a, b
+	if b.id < a.id {
+		first, second = b, a
+	}
+
+	first.m.Lock()
+	second.m.Lock()
+	return func() {
+		second.m.Unlock()
+		first.m.Unlock()
+	}
+}
+
 // copyTo copies the rest of f into wf without the bytes passing through this
 // process, and reports whether the pair supports that at all.
 //
@@ -1932,8 +1996,7 @@ func sameSession(a, b *File) bool {
 // the same bytes can be streamed instead. Any other error may leave wf
 // partially written.
 func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
-	f.m.Lock()
-	defer f.m.Unlock()
+	defer lockOffsets(f, wf)()
 
 	fail := func(err error) (bool, int64, error) {
 		return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: err}
@@ -1990,7 +2053,7 @@ func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
 	scc := &SrvCopychunkCopy{}
 	copy(scc.SourceKey[:], sr.ResumeKey())
 
-	plan := newCopychunkPlanner(off, woff, remains)
+	plan := newCopychunkPlanner(off, woff, remains, wf.maxCopychunks())
 	renegotiated := false
 
 	for !plan.done() {

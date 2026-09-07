@@ -2,10 +2,16 @@ package smb2
 
 import (
 	"encoding/binary"
+	"sync"
 	"testing"
+	"time"
 
 	. "github.com/edulution-io/go-smb2/internal/smb2"
 )
+
+// testMaxChunks is wider than any limit these tests set, so the planner clamps
+// nothing and the cases exercise the limits they were given.
+const testMaxChunks = 1 << 20
 
 // copyPlan drives copychunkPlanner the way copyTo does -- plan a request,
 // report that the server wrote all of it, plan the next -- and returns every
@@ -14,7 +20,7 @@ import (
 func copyPlan(t *testing.T, srcOff, dstOff, size int64, l copychunkLimits) []*SrvCopychunk {
 	t.Helper()
 
-	plan := newCopychunkPlanner(srcOff, dstOff, size)
+	plan := newCopychunkPlanner(srcOff, dstOff, size, testMaxChunks)
 	plan.narrow(l)
 
 	var (
@@ -175,7 +181,7 @@ func TestCopychunkPlannerRejectsImpossibleProgress(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			plan := newCopychunkPlanner(0, 0, 4000)
+			plan := newCopychunkPlanner(0, 0, 4000, testMaxChunks)
 			err := plan.advance(c.written, c.planned)
 
 			if c.wantErr {
@@ -204,7 +210,7 @@ func TestCopychunkPlannerRejectsImpossibleProgress(t *testing.T) {
 func TestCopychunkPlannerNarrowsWithoutLosingProgress(t *testing.T) {
 	const size = 40 * 1024 * 1024
 
-	plan := newCopychunkPlanner(0, 0, size)
+	plan := newCopychunkPlanner(0, 0, size, testMaxChunks)
 
 	// One request at the assumed limits lands.
 	chunks, planned := plan.next()
@@ -293,4 +299,110 @@ func itoa(n int64) string {
 		n /= 10
 	}
 	return string(b)
+}
+
+// A server answers a rejected request with its own limits, and the chunk count
+// is one of them. planCopychunks allocates a descriptor per chunk before ioctl
+// gets to measure the request, so an unbounded count lets a server size that
+// allocation by the length of the copy: 0xFFFFFFFF descriptors of one byte each
+// is one per byte of a 50 MiB file.
+func TestCopychunkPlannerClampsAdvertisedChunkCount(t *testing.T) {
+	const maxChunks = 170 // what a 4 KiB transaction leaves room for
+
+	plan := newCopychunkPlanner(0, 0, 50*1024*1024, maxChunks)
+	plan.narrow(copychunkLimits{chunks: 0xFFFFFFFF, chunkSize: 1, totalSize: 0xFFFFFFFF})
+
+	chunks, planned := plan.next()
+	if len(chunks) > maxChunks {
+		t.Errorf("planned %d chunks for an advertised 0xFFFFFFFF, want at most %d", len(chunks), maxChunks)
+	}
+	if planned <= 0 {
+		t.Errorf("planned %d bytes, want the request to still make progress", planned)
+	}
+}
+
+// The clamp must not stop a copy: a request that carries fewer chunks than the
+// server offered still advances, it just takes more of them.
+func TestCopychunkPlannerCompletesUnderAClampedCount(t *testing.T) {
+	const size = 4096
+
+	plan := newCopychunkPlanner(0, 0, size, 4)
+	plan.narrow(copychunkLimits{chunks: 0xFFFFFFFF, chunkSize: 64, totalSize: 0xFFFFFFFF})
+
+	var copied int64
+	for requests := 0; !plan.done(); requests++ {
+		if requests > 1000 {
+			t.Fatalf("still not done after %d requests, copied %d of %d", requests, copied, size)
+		}
+		chunks, planned := plan.next()
+		if len(chunks) > 4 {
+			t.Fatalf("planned %d chunks, want at most 4", len(chunks))
+		}
+		if err := plan.advance(planned, planned); err != nil {
+			t.Fatal(err)
+		}
+		copied += planned
+	}
+
+	if copied != size {
+		t.Errorf("copied %d bytes, want %d", copied, size)
+	}
+}
+
+// A zero bound would plan an empty request forever.
+func TestCopychunkLimitsClampFloorsAtOneChunk(t *testing.T) {
+	l := copychunkLimits{chunks: 16, chunkSize: 1024, totalSize: 16 * 1024}.clamp(0)
+	if l.chunks != 1 {
+		t.Errorf("clamp(0).chunks = %d, want 1", l.chunks)
+	}
+}
+
+// copyTo holds both handles' offsets. Ordering the two locks by id is what
+// keeps a copy of a onto b from deadlocking against a concurrent copy of b onto
+// a, and a handle copied onto itself must not take its own lock twice.
+func TestLockOffsets(t *testing.T) {
+	t.Run("a handle onto itself locks once", func(t *testing.T) {
+		f := &File{id: 1}
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			lockOffsets(f, f)()
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("lockOffsets(f, f) deadlocked on its own mutex")
+		}
+	})
+
+	t.Run("opposite directions do not deadlock", func(t *testing.T) {
+		a, b := &File{id: 1}, &File{id: 2}
+
+		var wg sync.WaitGroup
+		for i := 0; i < 100; i++ {
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				lockOffsets(a, b)()
+			}()
+			go func() {
+				defer wg.Done()
+				lockOffsets(b, a)()
+			}()
+		}
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("concurrent copies in opposite directions deadlocked")
+		}
+	})
 }

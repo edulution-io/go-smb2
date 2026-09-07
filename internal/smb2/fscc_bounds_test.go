@@ -74,3 +74,34 @@ func TestOtherDecodersRejectOverflowingLengths(t *testing.T) {
 		}
 	})
 }
+
+// IsInvalid reads the length field before it has checked the buffer is long
+// enough to hold that field, so a buffer shorter than the fixed part panics
+// inside IsInvalid itself instead of being rejected by it. A server does not
+// need to send a well-formed length for this: an empty or truncated response
+// is enough.
+func TestDecodersRejectRatherThanPanicOnAShortBuffer(t *testing.T) {
+	t.Run("FileDirectoryInformation", func(t *testing.T) {
+		for n := 0; n < 64; n++ {
+			if d := FileDirectoryInformationDecoder(make([]byte, n)); !d.IsInvalid() {
+				t.Errorf("a %d-byte buffer was accepted as valid", n)
+			}
+		}
+	})
+
+	t.Run("FileQuotaInformation", func(t *testing.T) {
+		for n := 0; n < 40; n++ {
+			if d := FileQuotaInformationDecoder(make([]byte, n)); !d.IsInvalid() {
+				t.Errorf("a %d-byte buffer was accepted as valid", n)
+			}
+		}
+	})
+
+	t.Run("SrvRequestResumeKeyResponse", func(t *testing.T) {
+		for n := 0; n < 28; n++ {
+			if d := SrvRequestResumeKeyResponseDecoder(make([]byte, n)); !d.IsInvalid() {
+				t.Errorf("a %d-byte buffer was accepted as valid", n)
+			}
+		}
+	})
+}

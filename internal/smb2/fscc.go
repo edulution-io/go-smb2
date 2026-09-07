@@ -141,6 +141,11 @@ func (c SymbolicLinkReparseDataBufferDecoder) PrintName() string {
 type SrvRequestResumeKeyResponseDecoder []byte
 
 func (c SrvRequestResumeKeyResponseDecoder) IsInvalid() bool {
+	// ContextLength is read out of c[24:28] before this checks the buffer is
+	// that long, so the check below needs a floor first, not just a wider sum.
+	if len(c) < 28 {
+		return true
+	}
 	if uint64(len(c)) < 28+uint64(c.ContextLength()) {
 		return true
 	}
@@ -314,6 +319,12 @@ type FileDirectoryInformationDecoder []byte
 // uint32 sum itself wraps. On a 32-bit one it is far wider, because int
 // is 32 bits there and the conversion overflows too.
 func (c FileDirectoryInformationDecoder) IsInvalid() bool {
+	// FileNameLength is read out of c[60:64]; check the buffer reaches that
+	// far before calling it, or a short buffer panics here instead of being
+	// rejected by it.
+	if len(c) < 64 {
+		return true
+	}
 	return uint64(len(c)) < 64+uint64(c.FileNameLength())
 }
 
@@ -450,6 +461,12 @@ func (c FileFsFullSizeInformationDecoder) BytesPerSector() uint32 {
 type FileQuotaInformationDecoder []byte
 
 func (c FileQuotaInformationDecoder) IsInvalid() bool {
+	// SidLength is read out of c[4:8]; check the fixed 40-byte part is
+	// present before calling it, or a short buffer panics here instead of
+	// being rejected by it.
+	if len(c) < 40 {
+		return true
+	}
 	return uint64(len(c)) < 40+uint64(c.SidLength())
 }
 

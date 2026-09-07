@@ -13,11 +13,9 @@ func challengeMessage(n int) []byte {
 	return cmsg
 }
 
-// Both payload fields are validated as offset+length in uint32, and both parts
-// come from the server: an offset of 0xFFFFFFFF with a length of 1 carries the
-// sum to 0, so the guard reads len(cmsg) < 0 and the slice that follows runs
-// from 0xFFFFFFFF. The challenge is parsed during session setup, before any
-// key is established, so this is reachable by an on-path attacker.
+// Both payload fields were validated as offset+length in uint32, so a
+// server-controlled offset of 0xFFFFFFFF with a length of 1 carried the sum
+// to 0 and cleared the guard.
 func TestClientAuthenticateRejectsWrappingPayloadOffsets(t *testing.T) {
 	tests := []struct {
 		name  string

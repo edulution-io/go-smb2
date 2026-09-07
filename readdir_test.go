@@ -51,11 +51,8 @@ func TestParseDirectoryEntriesSkipsDotEntries(t *testing.T) {
 	}
 }
 
-// NextEntryOffset is server-controlled and was never bounds checked, so an
-// offset past the end of the output buffer panicked the readdir loop rather
-// than being rejected. The panic is fatal: readdir runs on the caller's
-// goroutine but the same class of unchecked offset elsewhere kills the
-// receiver goroutine, and neither has a recover.
+// A NextEntryOffset past the end of the output buffer must be rejected
+// rather than sliced, which panicked.
 func TestParseDirectoryEntriesRejectsOutOfRangeNextEntryOffset(t *testing.T) {
 	for _, next := range []uint32{0xFFFFFFFF, 1 << 20, 75} {
 		entry := dirInfoEntry("a.txt", next)
@@ -75,11 +72,8 @@ func TestParseDirectoryEntriesRejectsOutOfRangeNextEntryOffset(t *testing.T) {
 }
 
 // NextEntryOffset must also advance past the entry just decoded, not merely
-// stay inside the buffer. Without that, a server can lay out one response so
-// the walk re-reads overlapping bytes as entry after entry: the buffer below
-// is 256 bytes, which holds at most four conforming entries, but stepping 8
-// bytes at a time yields 25 -- and with a large FileNameLength each of those
-// passes re-decodes a name, which is quadratic in the length the server chose.
+// stay inside the buffer, or the walk re-reads overlapping bytes as entry
+// after entry and makes no progress.
 func TestParseDirectoryEntriesRejectsNonAdvancingNextEntryOffset(t *testing.T) {
 	output := make([]byte, 256)
 	for off := 0; off+64 <= len(output); off += 8 {

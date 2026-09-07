@@ -401,8 +401,11 @@ type FileDispositionInformationEncoder struct {
 	DeletePending uint8
 }
 
+// MS-FSCC 2.4.11 defines FILE_DISPOSITION_INFORMATION as a single BOOLEAN.
+// The 4-byte Flags field belongs to the separate FILE_DISPOSITION_INFORMATION_EX
+// class, which this encoder does not implement.
 func (c *FileDispositionInformationEncoder) Size() int {
-	return 4
+	return 1
 }
 
 func (c *FileDispositionInformationEncoder) Encode(p []byte) {

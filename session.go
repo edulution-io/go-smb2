@@ -302,6 +302,14 @@ func (s *session) recv(rr *requestResponse) (pkt []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
+	// A closed or dead connection can surface as a short or zero-length packet
+	// with a nil error. Reject it structurally before relying on SessionId():
+	// before a session is established s.sessionId is still 0, the zero value
+	// SessionId() also falls back to on a too-short buffer, so the check below
+	// would otherwise let a malformed packet through during session setup.
+	if PacketCodec(pkt).IsInvalid() {
+		return nil, &InvalidResponseError{fmt.Sprintf("invalid response packet (length %d)", len(pkt))}
+	}
 	if sessionId := PacketCodec(pkt).SessionId(); sessionId != s.sessionId {
 		return nil, &InvalidResponseError{fmt.Sprintf("expected session id: %v, got %v", s.sessionId, sessionId)}
 	}

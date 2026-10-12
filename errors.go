@@ -16,6 +16,10 @@ func (err *TransportError) Error() string {
 	return fmt.Sprintf("connection error: %v", err.Err)
 }
 
+func (err *TransportError) Unwrap() error {
+	return err.Err
+}
+
 // InternalError represents internal error.
 type InternalError struct {
 	Message string

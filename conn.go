@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"fmt"
+	"net"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -94,8 +95,7 @@ func (n *Negotiator) negotiate(t transport, a *account, ctx context.Context) (*c
 		account:             a,
 		rdone:               make(chan struct{}, 1),
 		wdone:               make(chan struct{}, 1),
-		write:               make(chan []byte, 1),
-		werr:                make(chan error, 1),
+		write:               make(chan *outgoing, 1),
 	}
 
 	go conn.runSender()
@@ -300,8 +300,7 @@ type conn struct {
 
 	rdone chan struct{}
 	wdone chan struct{}
-	write chan []byte
-	werr  chan error
+	write chan *outgoing
 
 	m sync.Mutex
 
@@ -386,10 +385,12 @@ func (conn *conn) sendWith(req Packet, tc *treeConn, ctx context.Context) (rr *r
 		return nil, err
 	}
 
+	out := &outgoing{pkt: rr.pkt, err: make(chan error, 1)}
+
 	select {
-	case conn.write <- rr.pkt:
+	case conn.write <- out:
 		select {
-		case err = <-conn.werr:
+		case err = <-out.err:
 			if err != nil {
 				conn.outstandingRequests.pop(rr.msgId)
 
@@ -485,15 +486,23 @@ func (conn *conn) recv(rr *requestResponse) ([]byte, error) {
 	}
 }
 
+// outgoing is a packet for runSender and the channel it reports the write's
+// result on. The channel belongs to one request, so a request that stopped
+// waiting cannot leave its result to be read by the next one.
+type outgoing struct {
+	pkt []byte
+	err chan error
+}
+
 func (conn *conn) runSender() {
 	for {
 		select {
 		case <-conn.wdone:
 			return
-		case pkt := <-conn.write:
-			_, err := conn.t.Write(pkt)
+		case out := <-conn.write:
+			_, err := conn.t.Write(out.pkt)
 
-			conn.werr <- err
+			out.err <- err
 		}
 	}
 }
@@ -586,7 +595,9 @@ func (conn *conn) runReciever() {
 exit:
 	select {
 	case <-conn.rdone:
-		err = nil
+		// A logoff closed the transport. The connection is closed all the same,
+		// so later requests fail instead of waiting for a sender that has stopped.
+		err = &TransportError{net.ErrClosed}
 	default:
 		logger.Println("error:", err)
 	}

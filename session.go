@@ -70,13 +70,8 @@ func sessionSetup(conn *conn, i Initiator, ctx context.Context) (*session, error
 	}
 
 	sessionFlags := r.SessionFlags()
-	if conn.requireSigning {
-		if sessionFlags&SMB2_SESSION_FLAG_IS_GUEST != 0 {
-			return nil, &InvalidResponseError{"guest account doesn't support signing"}
-		}
-		if sessionFlags&SMB2_SESSION_FLAG_IS_NULL != 0 {
-			return nil, &InvalidResponseError{"anonymous account doesn't support signing"}
-		}
+	if err := validateSessionFlags(sessionFlags, conn.requireSigning); err != nil {
+		return nil, err
 	}
 
 	s := &session{
@@ -243,12 +238,42 @@ func sessionSetup(conn *conn, i Initiator, ctx context.Context) (*session, error
 		return nil, &InvalidResponseError{"broken session setup response format"}
 	}
 
-	s.sessionFlags = r.SessionFlags()
+	sessionFlags = r.SessionFlags()
+	if err := validateSessionFlags(sessionFlags, conn.requireSigning); err != nil {
+		return nil, err
+	}
+
+	// The receiver verifies nothing before enableSession, so this response is
+	// verified here, before its flags take effect ([MS-SMB2] 3.2.5.3.1). An SMB
+	// 3.1.1 server signs it whether or not signing is required.
+	if s.verifier != nil && sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 {
+		signed := PacketCodec(pkt).Flags()&SMB2_FLAGS_SIGNED != 0
+		if (conn.requireSigning || signed || conn.dialect == SMB311) && !s.verify(pkt) {
+			return nil, &InvalidResponseError{"session setup response failed signature verification"}
+		}
+	}
+
+	s.sessionFlags = sessionFlags
 
 	// now, allow access from receiver
 	s.enableSession()
 
 	return s, nil
+}
+
+// validateSessionFlags refuses guest and anonymous sessions when signing is
+// required, since neither has a key to sign with.
+func validateSessionFlags(sessionFlags uint16, requireSigning bool) error {
+	if !requireSigning {
+		return nil
+	}
+	if sessionFlags&SMB2_SESSION_FLAG_IS_GUEST != 0 {
+		return &InvalidResponseError{"guest account doesn't support signing"}
+	}
+	if sessionFlags&SMB2_SESSION_FLAG_IS_NULL != 0 {
+		return &InvalidResponseError{"anonymous account doesn't support signing"}
+	}
+	return nil
 }
 
 type session struct {

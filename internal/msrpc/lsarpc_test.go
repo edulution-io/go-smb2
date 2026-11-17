@@ -285,3 +285,26 @@ func FuzzResults(f *testing.F) {
 		_ = LsarLookupSidsResponseDecoder(b).ReturnValue()
 	})
 }
+
+// The bind ack, the share enumeration and the policy handle are server PDUs too.
+func FuzzDecoders(f *testing.F) {
+	f.Add([]byte{})
+	f.Add(make([]byte, 64))
+
+	f.Fuzz(func(t *testing.T, b []byte) {
+		if d := BindAckDecoder(b); !d.IsInvalid() {
+			_ = d.CallId()
+			_ = d.AssocGroupId()
+		}
+		if d := NetShareEnumAllResponseDecoder(b); !d.IsInvalid() {
+			_ = d.Buffer()
+			if !d.IsIncomplete() {
+				_ = d.ShareNameList()
+			}
+		}
+		if d := LsarOpenPolicy2ResponseDecoder(b); !d.IsInvalid() {
+			_ = d.PolicyHandle()
+			_ = d.ReturnValue()
+		}
+	})
+}

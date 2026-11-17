@@ -492,8 +492,9 @@ func (r NegotiateResponseDecoder) NegotiateContextOffset() uint32 {
 }
 
 func (r NegotiateResponseDecoder) NegotiateContextList() []byte {
-	off := r.NegotiateContextOffset()
-	if off < 64 {
+	off := uint64(r.NegotiateContextOffset())
+	// IsInvalid checks the offset only for SMB 3.1.1, the one dialect with contexts.
+	if off < 64 || off-64 > uint64(len(r)) {
 		return nil
 	}
 	return r[off-64:]

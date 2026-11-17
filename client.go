@@ -178,36 +178,9 @@ func (c *Session) ListSharenames() ([]string, error) {
 	output, err = f.ioctl(reqReq)
 	if err != nil {
 		if rerr, ok := err.(*ResponseError); ok && NtStatus(rerr.Code) == STATUS_BUFFER_OVERFLOW {
-			buf := make([]byte, 4280)
-
-			rlen := 4280 - len(output)
-
-			n, err := f.readAt(buf[:rlen], 0)
+			r2, err := readShareEnum(output, callId, func(b []byte) (int, error) { return f.readAt(b, 0) })
 			if err != nil {
 				return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: err}
-			}
-
-			output = append(output, buf[:n]...)
-
-			r2 := msrpc.NetShareEnumAllResponseDecoder(output)
-			if r2.IsInvalid() || r2.CallId() != callId {
-				return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken net share enum response format"}}
-			}
-
-			for r2.IsIncomplete() {
-				n, err := f.readAt(buf, 0)
-				if err != nil {
-					return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: err}
-				}
-
-				r3 := msrpc.NetShareEnumAllResponseDecoder(buf[:n])
-				if r3.IsInvalid() || r3.CallId() != callId {
-					return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken net share enum response format"}}
-				}
-
-				output = append(output, r3.Buffer()...)
-
-				r2 = msrpc.NetShareEnumAllResponseDecoder(output)
 			}
 
 			return r2.ShareNameList(), nil
@@ -222,6 +195,57 @@ func (c *Session) ListSharenames() ([]string, error) {
 	}
 
 	return r2.ShareNameList(), nil
+}
+
+const (
+	shareEnumFragmentSize = 4280 // max recv frag of the bind
+	maxShareEnumFragments = 256  // bounds a response the server keeps declaring incomplete
+)
+
+// readShareEnum reads the rest of a share enumeration that did not fit into the
+// ioctl output. Both the output and the fragments come from the server.
+func readShareEnum(output []byte, callId uint32, read func([]byte) (int, error)) (msrpc.NetShareEnumAllResponseDecoder, error) {
+	broken := &InvalidResponseError{"broken net share enum response format"}
+
+	if len(output) > shareEnumFragmentSize {
+		return nil, broken
+	}
+
+	buf := make([]byte, shareEnumFragmentSize)
+
+	n, err := read(buf[:shareEnumFragmentSize-len(output)])
+	if err != nil {
+		return nil, err
+	}
+
+	output = append(output, buf[:n]...)
+
+	r := msrpc.NetShareEnumAllResponseDecoder(output)
+	if r.IsInvalid() || r.CallId() != callId {
+		return nil, broken
+	}
+
+	for i := 0; r.IsIncomplete(); i++ {
+		if i == maxShareEnumFragments {
+			return nil, &InvalidResponseError{"net share enum response too large"}
+		}
+
+		n, err := read(buf)
+		if err != nil {
+			return nil, err
+		}
+
+		next := msrpc.NetShareEnumAllResponseDecoder(buf[:n])
+		if next.IsInvalid() || next.CallId() != callId {
+			return nil, broken
+		}
+
+		output = append(output, next.Buffer()...)
+
+		r = msrpc.NetShareEnumAllResponseDecoder(output)
+	}
+
+	return r, nil
 }
 
 // Share represents a SMB tree connection with VFS interface.

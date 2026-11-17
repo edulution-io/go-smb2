@@ -158,7 +158,9 @@ retry:
 		return nil, &InvalidResponseError{"broken negotiate response format"}
 	}
 
-	if r.DialectRevision() == SMB2 && n.minDialect() <= SMB210 {
+	// The wildcard asks for one retry with a specified dialect; a server that
+	// answers that with the wildcard again would keep the client looping.
+	if r.DialectRevision() == SMB2 && n.SpecifiedDialect == UnknownSMB && n.minDialect() <= SMB210 {
 		n.SpecifiedDialect = SMB210
 
 		goto retry
@@ -550,6 +552,10 @@ func newRecvBuffer(n int) []byte {
 	return make([]byte, n, n+signatureSize)
 }
 
+// malformedFrame is returned for a response the receiver cannot even split
+// into packets, which ends the connection.
+var malformedFrame = &InvalidResponseError{"malformed response frame"}
+
 func (conn *conn) runReciever() {
 	var err error
 
@@ -582,6 +588,12 @@ func (conn *conn) runReciever() {
 				continue
 			}
 
+			if PacketCodec(pkt).IsInvalid() {
+				err = malformedFrame
+
+				goto exit
+			}
+
 			p := PacketCodec(pkt)
 			if s := conn.session; s != nil {
 				if s.sessionId != p.SessionId() {
@@ -604,8 +616,18 @@ func (conn *conn) runReciever() {
 
 		for {
 			p := PacketCodec(pkt)
+			if p.IsInvalid() {
+				err = malformedFrame
+
+				goto exit
+			}
 
 			if off := p.NextCommand(); off != 0 {
+				if off < 64 || int(off) > len(pkt) {
+					err = malformedFrame
+
+					goto exit
+				}
 				pkt, next = pkt[:off], pkt[off:]
 			} else {
 				next = nil
@@ -742,6 +764,10 @@ func (conn *conn) tryDecrypt(pkt []byte) ([]byte, error, bool) {
 			return nil, &InvalidResponseError{"unknown session id returned"}, false
 		}
 
+		if conn.session.decrypter == nil {
+			return nil, &InvalidResponseError{"encrypted response on a session without a cipher"}, false
+		}
+
 		pkt, err := conn.session.decrypt(pkt)
 		if err != nil {
 			return nil, &InvalidResponseError{err.Error()}, false
@@ -764,6 +790,8 @@ func (conn *conn) tryVerify(pkt []byte, isEncrypted bool) error {
 		if p.Flags()&SMB2_FLAGS_SIGNED != 0 {
 			if conn.session == nil || conn.session.sessionId != p.SessionId() {
 				return &InvalidResponseError{"unknown session id returned"}
+			} else if conn.session.verifier == nil {
+				return &InvalidResponseError{"signed response on a session without a signing key"}
 			} else {
 				if !conn.session.verify(pkt) {
 					return &InvalidResponseError{"unverified packet returned"}

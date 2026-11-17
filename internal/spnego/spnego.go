@@ -3,6 +3,7 @@ package spnego
 import (
 	"encoding/asn1"
 	"errors"
+	"fmt"
 
 	"github.com/geoffgarside/ber"
 )
@@ -72,10 +73,23 @@ type NegTokenResp struct {
 	MechListMIC   []byte                `asn1:"optional,explicit,tag:3"`
 }
 
+// unmarshal turns a panic in the ber package into an error: on 32-bit builds a
+// declared length near 2^31 overflows its offset arithmetic.
+func unmarshal(bs []byte, v any, params string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("spnego: malformed token: %v", r)
+		}
+	}()
+
+	_, err = ber.UnmarshalWithParams(bs, v, params)
+	return err
+}
+
 func DecodeNegTokenInit2(bs []byte) (*NegTokenInit2, error) {
 	var init initialContextToken2
 
-	_, err := ber.UnmarshalWithParams(bs, &init, "application,tag:0")
+	err := unmarshal(bs, &init, "application,tag:0")
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +144,7 @@ func EncodeNegTokenInit(types []asn1.ObjectIdentifier, token []byte) ([]byte, er
 func DecodeNegTokenInit(bs []byte) (*NegTokenInit, error) {
 	var init initialContextToken
 
-	_, err := ber.UnmarshalWithParams(bs, &init, "application,tag:0")
+	err := unmarshal(bs, &init, "application,tag:0")
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +185,7 @@ func EncodeNegTokenResp(state asn1.Enumerated, typ asn1.ObjectIdentifier, token,
 func DecodeNegTokenResp(bs []byte) (*NegTokenResp, error) {
 	var resp NegTokenResp
 
-	_, err := ber.UnmarshalWithParams(bs, &resp, "explicit,tag:1")
+	err := unmarshal(bs, &resp, "explicit,tag:1")
 	if err != nil {
 		return nil, err
 	}

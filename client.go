@@ -2267,7 +2267,7 @@ func (f *File) ioctl(req *IoctlRequest) (output []byte, err error) {
 		if r.IsInvalid() {
 			return nil, err
 		}
-		return r.Output(), err
+		return ioctlOutput(r, req.MaxOutputResponse, err)
 	}
 
 	r := IoctlResponseDecoder(res)
@@ -2275,7 +2275,17 @@ func (f *File) ioctl(req *IoctlRequest) (output []byte, err error) {
 		return nil, &InvalidResponseError{"broken ioctl response format"}
 	}
 
-	return r.Output(), nil
+	return ioctlOutput(r, req.MaxOutputResponse, nil)
+}
+
+// ioctlOutput rejects more output than the request allowed; the server must
+// not send it, and callers size their buffers on MaxOutputResponse.
+func ioctlOutput(r IoctlResponseDecoder, maxOutputResponse uint32, err error) ([]byte, error) {
+	output := r.Output()
+	if uint64(len(output)) > uint64(maxOutputResponse) {
+		return nil, &InvalidResponseError{"ioctl output exceeds MaxOutputResponse"}
+	}
+	return output, err
 }
 
 func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {

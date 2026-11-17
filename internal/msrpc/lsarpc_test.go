@@ -298,9 +298,8 @@ func FuzzDecoders(f *testing.F) {
 		}
 		if d := NetShareEnumAllResponseDecoder(b); !d.IsInvalid() {
 			_ = d.Buffer()
-			if !d.IsIncomplete() {
-				_ = d.ShareNameList()
-			}
+			_ = d.IsIncomplete()
+			_ = d.ShareNameList()
 		}
 		if d := LsarOpenPolicy2ResponseDecoder(b); !d.IsInvalid() {
 			_ = d.PolicyHandle()

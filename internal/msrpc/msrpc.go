@@ -279,121 +279,73 @@ func (c NetShareEnumAllResponseDecoder) CancelCount() uint8 {
 }
 
 func (c NetShareEnumAllResponseDecoder) IsIncomplete() bool {
-	if len(c) < 48 {
-		return true
-	}
-
-	level := le.Uint32(c[24:28])
-
-	count := int(le.Uint32(c[36:40]))
-
-	switch level {
-	case 0:
-		offset := 48 + count*4 // name pointer
-		if len(c) < offset {
-			return true
-		}
-
-		for i := 0; i < count; i++ {
-			if len(c) < offset+12 {
-				return true
-			}
-
-			noff := int(le.Uint32(c[offset+4 : offset+8]))    // offset
-			nlen := int(le.Uint32(c[offset+8:offset+12])) * 2 // actual count
-			offset = roundup(offset+12+noff+nlen, 4)
-
-			if len(c) < offset {
-				return true
-			}
-		}
-	case 1:
-		offset := 48 + count*12
-		if len(c) < offset {
-			return true
-		}
-
-		for i := 0; i < count; i++ {
-			{ // name
-				if len(c) < offset+12 {
-					return true
-				}
-
-				noff := int(le.Uint32(c[offset+4 : offset+8]))    // offset
-				nlen := int(le.Uint32(c[offset+8:offset+12])) * 2 // actual count
-				offset = roundup(offset+12+noff+nlen, 4)
-
-				if len(c) < offset {
-					return true
-				}
-			}
-
-			{ // comment
-				if len(c) < offset+12 {
-					return true
-				}
-
-				coff := int(le.Uint32(c[offset+4 : offset+8]))    // offset
-				clen := int(le.Uint32(c[offset+8:offset+12])) * 2 // actual count
-				offset = roundup(offset+12+coff+clen, 4)
-
-				if len(c) < offset {
-					return true
-				}
-			}
-		}
-	default:
-		// TODO not supported yet
-		return true
-	}
-
-	return false
+	_, ok := c.shareNames(false)
+	return !ok
 }
 
 func (c NetShareEnumAllResponseDecoder) Buffer() []byte {
 	return c[24:]
 }
 
+// ShareNameList returns nil until the buffer holds every entry.
 func (c NetShareEnumAllResponseDecoder) ShareNameList() []string {
-	level := le.Uint32(c[24:28])
-
-	count := int(le.Uint32(c[36:40]))
-
-	ss := make([]string, count)
-
-	switch level {
-	case 0:
-		offset := 48 + count*4 // name pointer
-		for i := 0; i < count; i++ {
-			noff := int(le.Uint32(c[offset+4 : offset+8]))    // offset
-			nlen := int(le.Uint32(c[offset+8:offset+12])) * 2 // actual count
-
-			ss[i] = utf16le.DecodeToString(c[offset+12+noff : offset+12+noff+nlen])
-
-			offset = roundup(offset+12+noff+nlen, 4)
-		}
-	case 1:
-		offset := 48 + count*12
-		for i := 0; i < count; i++ {
-			{ // name
-				noff := int(le.Uint32(c[offset+4 : offset+8]))    // offset
-				nlen := int(le.Uint32(c[offset+8:offset+12])) * 2 // actual count
-
-				ss[i] = utf16le.DecodeToString(c[offset+12+noff : offset+12+noff+nlen])
-
-				offset = roundup(offset+12+noff+nlen, 4)
-			}
-
-			{ // comment
-				coff := int(le.Uint32(c[offset+4 : offset+8]))    // offset
-				clen := int(le.Uint32(c[offset+8:offset+12])) * 2 // actual count
-				offset = roundup(offset+12+coff+clen, 4)
-			}
-		}
-	default:
-		// TODO not supported yet
+	names, ok := c.shareNames(true)
+	if !ok {
 		return nil
 	}
+	return names
+}
 
-	return ss
+// shareNames walks the entries of a level 0 or 1 response; ok is false while
+// the buffer does not hold all of them. The arithmetic is in uint64 because a
+// count or length from the server does not fit a 32-bit int.
+func (c NetShareEnumAllResponseDecoder) shareNames(decode bool) (names []string, ok bool) {
+	if len(c) < 48 {
+		return nil, false
+	}
+
+	var pointerSize, fields uint64
+
+	switch le.Uint32(c[24:28]) {
+	case 0: // name
+		pointerSize, fields = 4, 1
+	case 1: // name, comment
+		pointerSize, fields = 12, 2
+	default:
+		return nil, false
+	}
+
+	size := uint64(len(c))
+	count := uint64(le.Uint32(c[36:40]))
+
+	offset := 48 + count*pointerSize
+	if size < offset {
+		return nil, false
+	}
+
+	if decode {
+		names = make([]string, 0, count)
+	}
+
+	for i := uint64(0); i < count; i++ {
+		for field := uint64(0); field < fields; field++ {
+			if size < offset+12 {
+				return nil, false
+			}
+
+			start := offset + 12 + uint64(le.Uint32(c[offset+4:offset+8])) // offset
+			end := start + uint64(le.Uint32(c[offset+8:offset+12]))*2      // actual count
+			offset = (end + 3) &^ 3
+
+			if size < offset {
+				return nil, false
+			}
+
+			if decode && field == 0 {
+				names = append(names, utf16le.DecodeToString(c[start:end]))
+			}
+		}
+	}
+
+	return names, true
 }

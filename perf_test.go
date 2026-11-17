@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
+	"hash"
 	"io"
 	"net"
 	"testing"
@@ -48,7 +49,7 @@ func benchSession(tb testing.TB) *session {
 
 	return &session{
 		sessionId: 0x1122334455667788,
-		signer:    hmac.New(sha256.New, key),
+		newSigner: func() hash.Hash { return hmac.New(sha256.New, key) },
 		verifier:  hmac.New(sha256.New, key),
 		encrypter: enc,
 		decrypter: dec,

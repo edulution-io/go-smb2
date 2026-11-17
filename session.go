@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"sync"
 
 	"github.com/edulution-io/go-smb2/internal/crypto/ccm"
 	"github.com/edulution-io/go-smb2/internal/crypto/cmac"
@@ -160,7 +161,7 @@ func sessionSetup(conn *conn, i Initiator, ctx context.Context) (*session, error
 func (s *session) deriveKeys(sessionKey, finalReq []byte) error {
 	switch s.dialect {
 	case SMB202, SMB210:
-		s.signer = hmac.New(sha256.New, sessionKey)
+		s.newSigner = func() hash.Hash { return hmac.New(sha256.New, sessionKey) }
 		s.verifier = hmac.New(sha256.New, sessionKey)
 	case SMB300, SMB302:
 		signingKey := kdf(sessionKey, []byte("SMB2AESCMAC\x00"), []byte("SmbSign\x00"))
@@ -168,7 +169,8 @@ func (s *session) deriveKeys(sessionKey, finalReq []byte) error {
 		if err != nil {
 			return &InternalError{err.Error()}
 		}
-		s.signer = cmac.New(ciph)
+		signingCipher := ciph // ciph is reused for the encryption keys below
+		s.newSigner = func() hash.Hash { return cmac.New(signingCipher) }
 		s.verifier = cmac.New(ciph)
 
 		// s.applicationKey = kdf(sessionKey, []byte("SMB2APP\x00"), []byte("SmbRpc\x00"))
@@ -207,7 +209,7 @@ func (s *session) deriveKeys(sessionKey, finalReq []byte) error {
 		if err != nil {
 			return &InternalError{err.Error()}
 		}
-		s.signer = cmac.New(ciph)
+		s.newSigner = func() hash.Hash { return cmac.New(ciph) }
 		s.verifier = cmac.New(ciph)
 
 		// s.applicationKey = kdf(sessionKey, []byte("SMBAppKey\x00"), preauthIntegrityHashValue)
@@ -290,7 +292,10 @@ type session struct {
 	sessionId                 uint64
 	preauthIntegrityHashValue [64]byte
 
-	signer    hash.Hash
+	// newSigner makes the signing hashes that sign pools, so that senders
+	// sign in parallel; the receiver alone uses verifier.
+	newSigner func() hash.Hash
+	signers   sync.Pool
 	verifier  hash.Hash
 	encrypter cipher.AEAD
 	decrypter cipher.AEAD
@@ -353,7 +358,11 @@ func (s *session) sign(pkt []byte) []byte {
 
 	p.SetFlags(p.Flags() | SMB2_FLAGS_SIGNED)
 
-	h := s.signer
+	h, _ := s.signers.Get().(hash.Hash)
+	if h == nil {
+		h = s.newSigner()
+	}
+	defer s.signers.Put(h)
 
 	h.Reset()
 

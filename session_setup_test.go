@@ -7,6 +7,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/asn1"
+	"hash"
 	"net"
 	"slices"
 	"sync"
@@ -27,9 +28,9 @@ func newSigningSession(t *testing.T, dialect uint16) *session {
 		t.Fatal(err)
 	}
 	return &session{
-		conn:     &conn{dialect: dialect},
-		signer:   cmac.New(ciph),
-		verifier: cmac.New(ciph),
+		conn:      &conn{dialect: dialect},
+		newSigner: func() hash.Hash { return cmac.New(ciph) },
+		verifier:  cmac.New(ciph),
 	}
 }
 
@@ -157,7 +158,7 @@ func TestSessionSetupIgnoresIntermediateFlags(t *testing.T) {
 		{name: "signed with another key", signKey: bytes.Repeat([]byte{0x22}, 16)},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			server := &session{conn: &conn{dialect: SMB210}, signer: hmac.New(sha256.New, tt.signKey)}
+			server := &session{conn: &conn{dialect: SMB210}, newSigner: func() hash.Hash { return hmac.New(sha256.New, tt.signKey) }}
 
 			tr := newScriptedTransport(func(req []byte) []byte {
 				res := &SessionSetupResponse{}

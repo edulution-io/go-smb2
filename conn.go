@@ -400,21 +400,31 @@ func (conn *conn) send(req Packet, ctx context.Context) (rr *requestResponse, er
 
 func (conn *conn) sendWith(req Packet, tc *treeConn, ctx context.Context) (rr *requestResponse, err error) {
 	conn.m.Lock()
-	defer conn.m.Unlock()
 
 	if conn.err != nil {
+		conn.m.Unlock()
+
 		return nil, conn.err
 	}
 
 	select {
 	case <-ctx.Done():
+		conn.m.Unlock()
+
 		return nil, &ContextError{Err: ctx.Err()}
 	default:
 		// do nothing
 	}
 
-	rr, err = conn.makeRequestResponse(req, tc, ctx)
-	if err != nil {
+	rr = conn.registerRequest(req, tc, ctx)
+
+	conn.m.Unlock()
+
+	// Encoding, signing and encrypting run outside the lock, so goroutines
+	// sharing the connection prepare their requests in parallel.
+	if err := conn.encodeRequest(rr, req, tc); err != nil {
+		conn.outstandingRequests.pop(rr.msgId)
+
 		return nil, err
 	}
 
@@ -434,6 +444,12 @@ func (conn *conn) sendWith(req Packet, tc *treeConn, ctx context.Context) (rr *r
 
 			return nil, &ContextError{Err: ctx.Err()}
 		}
+	case <-conn.wdone:
+		// The receiver stopped after this request was registered; without the
+		// lock held, the sender may be gone too.
+		conn.outstandingRequests.pop(rr.msgId)
+
+		return nil, &TransportError{net.ErrClosed}
 	case <-ctx.Done():
 		conn.outstandingRequests.pop(rr.msgId)
 
@@ -443,7 +459,9 @@ func (conn *conn) sendWith(req Packet, tc *treeConn, ctx context.Context) (rr *r
 	return rr, nil
 }
 
-func (conn *conn) makeRequestResponse(req Packet, tc *treeConn, ctx context.Context) (rr *requestResponse, err error) {
+// registerRequest assigns the message id and credits and registers the
+// request; the caller holds conn.m.
+func (conn *conn) registerRequest(req Packet, tc *treeConn, ctx context.Context) *requestResponse {
 	hdr := req.Header()
 
 	var msgId uint64
@@ -473,6 +491,22 @@ func (conn *conn) makeRequestResponse(req Packet, tc *treeConn, ctx context.Cont
 		}
 	}
 
+	rr := &requestResponse{
+		msgId:         msgId,
+		creditRequest: hdr.CreditRequestResponse,
+		ctx:           ctx,
+		recv:          make(chan []byte, 1),
+	}
+
+	conn.outstandingRequests.set(msgId, rr)
+
+	return rr
+}
+
+// encodeRequest encodes, then signs or encrypts the request into rr.pkt.
+func (conn *conn) encodeRequest(rr *requestResponse, req Packet, tc *treeConn) (err error) {
+	s := conn.session
+
 	var pkt []byte
 	var encrypted, signed bool
 
@@ -494,7 +528,7 @@ func (conn *conn) makeRequestResponse(req Packet, tc *treeConn, ctx context.Cont
 
 		pkt, err = s.encryptInPlace(pkt)
 		if err != nil {
-			return nil, &InternalError{err.Error()}
+			return &InternalError{err.Error()}
 		}
 	} else {
 		pkt = make([]byte, req.Size())
@@ -506,18 +540,10 @@ func (conn *conn) makeRequestResponse(req Packet, tc *treeConn, ctx context.Cont
 		}
 	}
 
-	rr = &requestResponse{
-		msgId:         msgId,
-		creditRequest: hdr.CreditRequestResponse,
-		pkt:           pkt,
-		ctx:           ctx,
-		recv:          make(chan []byte, 1),
-		encrypted:     encrypted,
-	}
+	rr.pkt = pkt
+	rr.encrypted = encrypted
 
-	conn.outstandingRequests.set(msgId, rr)
-
-	return rr, nil
+	return nil
 }
 
 func (conn *conn) recv(rr *requestResponse) ([]byte, error) {

@@ -482,7 +482,19 @@ func (fs *Share) remove(name string) error {
 	return nil
 }
 
+// Rename renames oldpath to newpath. Unlike os.Rename it refuses an existing
+// newpath with os.ErrExist; RenameReplace overwrites it.
 func (fs *Share) Rename(oldpath, newpath string) error {
+	return fs.rename(oldpath, newpath, 0)
+}
+
+// RenameReplace renames oldpath to newpath, replacing newpath if it exists, in
+// a single request, so newpath is never missing in between.
+func (fs *Share) RenameReplace(oldpath, newpath string) error {
+	return fs.rename(oldpath, newpath, 1)
+}
+
+func (fs *Share) rename(oldpath, newpath string, replaceIfExists uint8) error {
 	oldpath = normPath(oldpath)
 	newpath = normPath(newpath)
 
@@ -515,7 +527,7 @@ func (fs *Share) Rename(oldpath, newpath string) error {
 		FileInfoClass:         FileRenameInformation,
 		AdditionalInformation: 0,
 		Input: &FileRenameInformationType2Encoder{
-			ReplaceIfExists: 0,
+			ReplaceIfExists: replaceIfExists,
 			RootDirectory:   0,
 			FileName:        newpath,
 		},

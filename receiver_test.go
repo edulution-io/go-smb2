@@ -32,6 +32,15 @@ func TestReceiver_FailsTheConnectionOnAMalformedFrame(t *testing.T) {
 		{"header cut short", func(req []byte) []byte { return negotiateResponse(req, SMB210)[:40] }, "malformed response"},
 		{"next command beyond the frame", withNextCommand(0x1000), "malformed response"},
 		{"next command inside the header", withNextCommand(8), "malformed response"},
+		// MS-SMB2 2.2.1 places every chained header on an 8-byte boundary.
+		{"next command not 8-byte aligned", func(req []byte) []byte {
+			head := negotiateResponse(req, SMB210)
+			if len(head)%8 == 0 {
+				head = append(head, 0)
+			}
+			binary.LittleEndian.PutUint32(head[20:24], uint32(len(head)))
+			return append(head, negotiateResponse(req, SMB210)...)
+		}, "malformed response"},
 		// The head is delivered before the tail is parsed, so the dial fails on
 		// the cut-short NEGOTIATE body; what matters is that the tail does not panic.
 		{"next command leaving a short tail", withNextCommand(64 + 64 - 8), "negotiate response"},

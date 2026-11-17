@@ -69,15 +69,15 @@ func (r *LsarpcBind) Encode(b []byte) {
 
 	b[4] = 0x10 // LE, IEEE, ASCII
 
-	le.PutUint16(b[8:10], 72)        // frag length
-	le.PutUint16(b[10:12], 0)        // auth length
-	le.PutUint32(b[12:16], r.CallId) // call id
-	le.PutUint16(b[16:18], 4280)     // max xmit frag
-	le.PutUint16(b[18:20], 4280)     // max recv frag
-	le.PutUint32(b[20:24], 0)        // assoc group
-	le.PutUint32(b[24:28], 1)        // num ctx items
-	le.PutUint16(b[28:30], 0)        // ctx item[1] .context id
-	le.PutUint16(b[30:32], 1)        // ctx item[1] .num trans items
+	le.PutUint16(b[8:10], 72)           // frag length
+	le.PutUint16(b[10:12], 0)           // auth length
+	le.PutUint32(b[12:16], r.CallId)    // call id
+	le.PutUint16(b[16:18], MaxFragSize) // max xmit frag
+	le.PutUint16(b[18:20], MaxFragSize) // max recv frag
+	le.PutUint32(b[20:24], 0)           // assoc group
+	le.PutUint32(b[24:28], 1)           // num ctx items
+	le.PutUint16(b[28:30], 0)           // ctx item[1] .context id
+	le.PutUint16(b[30:32], 1)           // ctx item[1] .num trans items
 
 	_, _ = hex.Decode(b[32:48], LSARPC_UUID)
 	le.PutUint16(b[48:50], LSARPC_VERSION)

@@ -41,6 +41,17 @@ jobs:
         check-latest: true
     - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
+  # Unit tests and fuzz seeds on a 32-bit int, where uint32 fields from the
+  # server can turn negative. The Samba tests skip without client_conf.json.
+  test_386:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: stable
+    - run: GOARCH=386 go test ./...
+
   test_linux:
     strategy:
       matrix:

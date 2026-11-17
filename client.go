@@ -141,7 +141,7 @@ func (c *Session) ListSharenames() ([]string, error) {
 		OutputOffset:      0,
 		OutputCount:       0,
 		MaxInputResponse:  0,
-		MaxOutputResponse: 4280,
+		MaxOutputResponse: msrpc.MaxFragSize,
 		Flags:             SMB2_0_IOCTL_IS_FSCTL,
 		Input: &msrpc.Bind{
 			CallId: callId,
@@ -178,36 +178,9 @@ func (c *Session) ListSharenames() ([]string, error) {
 	output, err = f.ioctl(reqReq)
 	if err != nil {
 		if rerr, ok := err.(*ResponseError); ok && NtStatus(rerr.Code) == STATUS_BUFFER_OVERFLOW {
-			buf := make([]byte, 4280)
-
-			rlen := 4280 - len(output)
-
-			n, err := f.readAt(buf[:rlen], 0)
+			r2, err := readShareEnum(output, callId, func(b []byte) (int, error) { return f.readAt(b, 0) })
 			if err != nil {
 				return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: err}
-			}
-
-			output = append(output, buf[:n]...)
-
-			r2 := msrpc.NetShareEnumAllResponseDecoder(output)
-			if r2.IsInvalid() || r2.CallId() != callId {
-				return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken net share enum response format"}}
-			}
-
-			for r2.IsIncomplete() {
-				n, err := f.readAt(buf, 0)
-				if err != nil {
-					return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: err}
-				}
-
-				r3 := msrpc.NetShareEnumAllResponseDecoder(buf[:n])
-				if r3.IsInvalid() || r3.CallId() != callId {
-					return nil, &os.PathError{Op: "listSharenames", Path: f.name, Err: &InvalidResponseError{"broken net share enum response format"}}
-				}
-
-				output = append(output, r3.Buffer()...)
-
-				r2 = msrpc.NetShareEnumAllResponseDecoder(output)
 			}
 
 			return r2.ShareNameList(), nil
@@ -222,6 +195,55 @@ func (c *Session) ListSharenames() ([]string, error) {
 	}
 
 	return r2.ShareNameList(), nil
+}
+
+// maxShareEnumFragments bounds a response the server keeps declaring incomplete.
+const maxShareEnumFragments = 256
+
+// readShareEnum reads the rest of a share enumeration that did not fit into the
+// ioctl output. Both the output and the fragments come from the server.
+func readShareEnum(output []byte, callId uint32, read func([]byte) (int, error)) (msrpc.NetShareEnumAllResponseDecoder, error) {
+	broken := &InvalidResponseError{"broken net share enum response format"}
+
+	if len(output) > msrpc.MaxFragSize {
+		return nil, broken
+	}
+
+	buf := make([]byte, msrpc.MaxFragSize)
+
+	n, err := read(buf[:msrpc.MaxFragSize-len(output)])
+	if err != nil {
+		return nil, err
+	}
+
+	output = append(output, buf[:n]...)
+
+	r := msrpc.NetShareEnumAllResponseDecoder(output)
+	if r.IsInvalid() || r.CallId() != callId {
+		return nil, broken
+	}
+
+	for i := 0; r.IsIncomplete(); i++ {
+		if i == maxShareEnumFragments {
+			return nil, &InvalidResponseError{"net share enum response too large"}
+		}
+
+		n, err := read(buf)
+		if err != nil {
+			return nil, err
+		}
+
+		next := msrpc.NetShareEnumAllResponseDecoder(buf[:n])
+		if next.IsInvalid() || next.CallId() != callId {
+			return nil, broken
+		}
+
+		output = append(output, next.Buffer()...)
+
+		r = msrpc.NetShareEnumAllResponseDecoder(output)
+	}
+
+	return r, nil
 }
 
 // Share represents a SMB tree connection with VFS interface.
@@ -2245,7 +2267,7 @@ func (f *File) ioctl(req *IoctlRequest) (output []byte, err error) {
 		if r.IsInvalid() {
 			return nil, err
 		}
-		return r.Output(), err
+		return ioctlOutput(r, req.MaxOutputResponse, err)
 	}
 
 	r := IoctlResponseDecoder(res)
@@ -2253,7 +2275,17 @@ func (f *File) ioctl(req *IoctlRequest) (output []byte, err error) {
 		return nil, &InvalidResponseError{"broken ioctl response format"}
 	}
 
-	return r.Output(), nil
+	return ioctlOutput(r, req.MaxOutputResponse, nil)
+}
+
+// ioctlOutput rejects more output than the request allowed; the server must
+// not send it, and callers size their buffers on MaxOutputResponse.
+func ioctlOutput(r IoctlResponseDecoder, maxOutputResponse uint32, err error) ([]byte, error) {
+	output := r.Output()
+	if uint64(len(output)) > uint64(maxOutputResponse) {
+		return nil, &InvalidResponseError{"ioctl output exceeds MaxOutputResponse"}
+	}
+	return output, err
 }
 
 func (f *File) readdir(pattern string) (fi []os.FileInfo, err error) {

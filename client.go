@@ -336,6 +336,8 @@ func (fs *Share) OpenFile(name string, flag int, perm os.FileMode) (*File, error
 		return nil, &os.PathError{Op: "open", Path: name, Err: err}
 	}
 	if flag&os.O_APPEND != 0 {
+		f.appendOnly = true
+
 		if _, err := f.seek(0, io.SeekEnd); err != nil {
 			_ = f.close()
 			return nil, &os.PathError{Op: "open", Path: name, Err: err}
@@ -1091,6 +1093,10 @@ type File struct {
 
 	offset int64
 
+	// appendOnly is set for O_APPEND: the handle has FILE_APPEND_DATA without
+	// FILE_WRITE_DATA, so the server may append each write whatever its offset.
+	appendOnly bool
+
 	// id orders the offset locks when a copy holds two handles; see
 	// lockOffsets. newFile assigns it, so no two handles share one.
 	id uint64
@@ -1299,9 +1305,13 @@ func (f *File) readAtSerial(b []byte, off int64) (n int, err error) {
 // readAtPipelined reads with up to maxChunksInFlight requests in flight and
 // returns what readAtSerial would: the bytes up to the first short chunk.
 func (f *File) readAtPipelined(b []byte, off int64) (n int, err error) {
+	// Each chunk is copied into its own part of b as soon as it arrives, so
+	// no more than maxChunksInFlight response buffers are held at a time.
 	chunks, err := f.dispatchChunks(len(b), f.maxReadSize(), func(c *chunk, creditCharge uint16) bool {
-		c.data, c.err = f.readLoaned(creditCharge, c.size, off+int64(c.start))
-		return c.err != nil || len(c.data) < c.size
+		var data []byte
+		data, c.err = f.readLoaned(creditCharge, c.size, off+int64(c.start))
+		c.done = copy(b[c.start:c.start+c.size], data)
+		return c.err != nil || c.done < c.size
 	})
 
 	for _, c := range chunks {
@@ -1312,9 +1322,9 @@ func (f *File) readAtPipelined(b []byte, off int64) (n int, err error) {
 			return 0, c.err
 		}
 
-		n += copy(b[c.start:], c.data)
+		n += c.done
 
-		if len(c.data) < c.size {
+		if c.done < c.size {
 			return n, nil
 		}
 	}
@@ -1749,7 +1759,8 @@ func (f *File) writeAt(b []byte, off int64) (n int, err error) {
 		return 0, nil
 	}
 
-	if !f.pipelined() || len(b) <= f.maxWriteSize() {
+	// Appended chunks land in the order they arrive, so they go one by one.
+	if !f.pipelined() || f.appendOnly || len(b) <= f.maxWriteSize() {
 		return f.writeAtSerial(b, off)
 	}
 
@@ -1804,8 +1815,8 @@ func (f *File) writeAtSerial(b []byte, off int64) (n int, err error) {
 // returns how many bytes from the start of b were written without a gap.
 func (f *File) writeAtPipelined(b []byte, off int64) (n int, err error) {
 	chunks, err := f.dispatchChunks(len(b), f.maxWriteSize(), func(c *chunk, creditCharge uint16) bool {
-		c.written, c.err = f.writeLoaned(creditCharge, b[c.start:c.start+c.size], off+int64(c.start))
-		return c.err != nil || c.written < c.size
+		c.done, c.err = f.writeLoaned(creditCharge, b[c.start:c.start+c.size], off+int64(c.start))
+		return c.err != nil || c.done < c.size
 	})
 
 	for _, c := range chunks {
@@ -1813,9 +1824,9 @@ func (f *File) writeAtPipelined(b []byte, off int64) (n int, err error) {
 			return 0, c.err
 		}
 
-		n += c.written
+		n += c.done
 
-		if c.written < c.size {
+		if c.done < c.size {
 			return n, nil
 		}
 	}
@@ -1885,10 +1896,8 @@ const maxChunksInFlight = 8
 // to the caller's buffer.
 type chunk struct {
 	start, size int
-
-	data    []byte // read
-	written int    // write
-	err     error
+	done        int // bytes read or written
+	err         error
 }
 
 // pipelined reports whether a transfer may keep several chunks in flight. On

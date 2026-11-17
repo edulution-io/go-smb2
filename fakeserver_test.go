@@ -37,6 +37,8 @@ type fakeServer struct {
 	dialect uint16
 	// signingOptional leaves signing enabled but not required.
 	signingOptional bool
+	// files, when set, answers the requests after the login.
+	files *fakeFiles
 }
 
 func readFrame(c net.Conn) ([]byte, error) {
@@ -178,6 +180,10 @@ func (s *fakeServer) serve() {
 		final = s.final(final, key)
 	}
 	if writeFrame(s.conn, final) != nil {
+		return
+	}
+	if s.files != nil {
+		s.files.serve(s.conn, key)
 		return
 	}
 	_, _ = io.Copy(io.Discard, s.conn)

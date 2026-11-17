@@ -2,6 +2,7 @@ package ccm
 
 import (
 	"crypto/cipher"
+	"crypto/subtle"
 )
 
 // CBC-MAC implementation
@@ -26,15 +27,17 @@ func (m *mac) Reset() {
 }
 
 func (m *mac) Write(p []byte) (n int, err error) {
-	for _, c := range p {
-		if m.p >= len(m.ci) {
+	n = len(p)
+	for len(p) > 0 {
+		if m.p == len(m.ci) {
 			m.c.Encrypt(m.ci, m.ci)
 			m.p = 0
 		}
-		m.ci[m.p] ^= c
-		m.p++
+		k := subtle.XORBytes(m.ci[m.p:], m.ci[m.p:], p)
+		m.p += k
+		p = p[k:]
 	}
-	return len(p), nil
+	return n, nil
 }
 
 // PadZero emulates zero byte padding.

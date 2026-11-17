@@ -10,7 +10,6 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	. "github.com/edulution-io/go-smb2/internal/erref"
 	. "github.com/edulution-io/go-smb2/internal/smb2"
@@ -369,24 +368,6 @@ func (conn *conn) useSession() bool {
 
 func (conn *conn) enableSession() {
 	atomic.StoreInt32(&conn._useSession, 1)
-}
-
-func (conn *conn) newTimer() *time.Timer {
-	return time.NewTimer(5 * time.Second)
-}
-
-func (conn *conn) sendRecv(cmd uint16, req Packet, ctx context.Context) (res []byte, err error) {
-	rr, err := conn.send(req, ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	pkt, err := conn.recv(rr)
-	if err != nil {
-		return nil, err
-	}
-
-	return accept(cmd, pkt)
 }
 
 func (conn *conn) loanCredit(payloadSize int, ctx context.Context) (creditCharge uint16, grantedPayloadSize int, err error) {

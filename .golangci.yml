@@ -1,0 +1,27 @@
+version: "2"
+
+linters:
+  settings:
+    staticcheck:
+      checks:
+        - all
+        # Defaults of golangci-lint.
+        - -ST1000
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        # The packages are built around dot imports of internal/smb2 and erref.
+        - -ST1001
+        - -QF1008
+    errcheck:
+      exclude-functions:
+        # CBC-MAC accumulation never fails.
+        - (*github.com/edulution-io/go-smb2/internal/crypto/ccm.mac).Write
+  exclusions:
+    rules:
+      # Test cleanup (Close, Remove, Umount) is best effort.
+      - path: _test\.go
+        linters:
+          - errcheck

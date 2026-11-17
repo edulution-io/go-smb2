@@ -99,7 +99,7 @@ func normPath(path string) string {
 	if !NORMALIZE_PATH {
 		return path
 	}
-	path = strings.Replace(path, `/`, `\`, -1)
+	path = strings.ReplaceAll(path, `/`, `\`)
 	for strings.HasPrefix(path, `.\`) {
 		path = path[2:]
 	}
@@ -113,7 +113,7 @@ func normPattern(pattern string) string {
 	if !NORMALIZE_PATH {
 		return pattern
 	}
-	pattern = strings.Replace(pattern, `/`, `\`, -1)
+	pattern = strings.ReplaceAll(pattern, `/`, `\`)
 	for strings.HasPrefix(pattern, `.\`) {
 		pattern = pattern[2:]
 	}

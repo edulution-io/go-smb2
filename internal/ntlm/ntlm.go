@@ -8,7 +8,7 @@ import (
 	"hash"
 	"hash/crc32"
 
-	"golang.org/x/crypto/md4"
+	"golang.org/x/crypto/md4" //nolint:staticcheck // NTOWFv2 is defined over MD4.
 )
 
 var zero [16]byte
@@ -77,18 +77,6 @@ const (
 	MsvAvTargetName
 	MsvAvChannelBindings
 )
-
-type addr struct {
-	typ uint32
-	val []byte
-}
-
-// channelBindings represents gss_channel_bindings_struct
-type channelBindings struct {
-	InitiatorAddress addr
-	AcceptorAddress  addr
-	AppData          []byte
-}
 
 var signature = []byte("NTLMSSP\x00")
 
@@ -235,8 +223,6 @@ func (i *targetInfoEncoder) encode(dst []byte) {
 
 	le.PutUint16(dst[off:off+2], MsvAvEOL)
 	le.PutUint16(dst[off+2:off+4], 0)
-
-	off += 4
 }
 
 func mac(dst []byte, negotiateFlags uint32, handle *rc4.Cipher, signingKey []byte, seqNum uint32, msg []byte) ([]byte, uint32) {

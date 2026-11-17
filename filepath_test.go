@@ -83,7 +83,7 @@ func TestMatch(t *testing.T) {
 
 	for _, tt := range cases {
 		pattern := tt.pattern
-		s := strings.Replace(tt.s, `/`, `\`, -1)
+		s := strings.ReplaceAll(tt.s, `/`, `\`)
 		ok, err := Match(pattern, s)
 		if ok != tt.match || err != tt.err {
 			t.Errorf("Match(%#q, %#q) = %v, %q want %v, %q", pattern, s, ok, errp(err), tt.match, errp(tt.err))

@@ -308,7 +308,7 @@ func (s *session) logoff(ctx context.Context) error {
 	}
 
 	s.conn.rdone <- struct{}{}
-	s.conn.t.Close()
+	_ = s.conn.t.Close()
 
 	return nil
 }

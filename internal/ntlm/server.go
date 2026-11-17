@@ -215,7 +215,7 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 
 		keyExchangeKey := sessionBaseKey // if ntlm version == 2
 
-		if flags&NTLMSSP_NEGOTIATE_KEY_EXCH != 0 {
+		if exchangesKey(flags) {
 			session.exportedSessionKey = make([]byte, 16)
 			cipher, err := rc4.NewCipher(keyExchangeKey)
 			if err != nil {

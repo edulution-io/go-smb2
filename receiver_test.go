@@ -32,6 +32,15 @@ func TestReceiver_FailsTheConnectionOnAMalformedFrame(t *testing.T) {
 		{"header cut short", func(req []byte) []byte { return negotiateResponse(req, SMB210)[:40] }, "malformed response"},
 		{"next command beyond the frame", withNextCommand(0x1000), "malformed response"},
 		{"next command inside the header", withNextCommand(8), "malformed response"},
+		// MS-SMB2 2.2.1 places every chained header on an 8-byte boundary.
+		{"next command not 8-byte aligned", func(req []byte) []byte {
+			head := negotiateResponse(req, SMB210)
+			if len(head)%8 == 0 {
+				head = append(head, 0)
+			}
+			binary.LittleEndian.PutUint32(head[20:24], uint32(len(head)))
+			return append(head, negotiateResponse(req, SMB210)...)
+		}, "malformed response"},
 		// The head is delivered before the tail is parsed, so the dial fails on
 		// the cut-short NEGOTIATE body; what matters is that the tail does not panic.
 		{"next command leaving a short tail", withNextCommand(64 + 64 - 8), "negotiate response"},
@@ -155,5 +164,42 @@ func TestTryVerify_RejectsASignedFrameWithoutAVerifier(t *testing.T) {
 
 	if err := c.tryVerify(pkt, false); err == nil {
 		t.Error("tryVerify = nil error, want a rejection")
+	}
+}
+
+type panickingTransport struct{ transport }
+
+func (panickingTransport) ReadSize() (int, error) { panic("parser bug") }
+
+// TestReceiver_FailsTheConnectionInsteadOfPanicking pins that a panic in the
+// receiver goroutine, which no caller can recover, ends only this connection.
+func TestReceiver_FailsTheConnectionInsteadOfPanicking(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	c := &conn{
+		t:                   panickingTransport{direct(client)},
+		outstandingRequests: newOutstandingRequests(),
+		rdone:               make(chan struct{}, 1),
+		wdone:               make(chan struct{}, 1),
+	}
+	done := make(chan struct{})
+	go func() {
+		c.runReciever()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the receiver kept running after a panic")
+	}
+	c.m.Lock()
+	defer c.m.Unlock()
+	if _, ok := c.err.(*InvalidResponseError); !ok {
+		t.Errorf("conn.err = %#v, want an *InvalidResponseError", c.err)
+	}
+	select {
+	case <-c.wdone:
+	default:
+		t.Error("wdone was not closed, so a waiting sender would hang")
 	}
 }

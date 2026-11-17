@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	runtimedebug "runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -615,24 +616,27 @@ func newRecvBuffer(n int) []byte {
 // into packets, which ends the connection.
 var malformedFrame = &InvalidResponseError{"malformed response frame"}
 
-func (conn *conn) runReciever() {
-	var err error
+// receive reads frames until the connection fails. A panic here could not be
+// recovered by any caller and would take the whole process down.
+func (conn *conn) receive() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Printf("receiver panic: %v\n%s", r, runtimedebug.Stack())
+			err = &InvalidResponseError{fmt.Sprintf("receiver panic: %v", r)}
+		}
+	}()
 
 	for {
 		n, e := conn.t.ReadSize()
 		if e != nil {
-			err = &TransportError{e}
-
-			goto exit
+			return &TransportError{e}
 		}
 
 		pkt := newRecvBuffer(n)
 
 		_, e = conn.t.Read(pkt)
 		if e != nil {
-			err = &TransportError{e}
-
-			goto exit
+			return &TransportError{e}
 		}
 
 		hasSession := conn.useSession()
@@ -648,9 +652,7 @@ func (conn *conn) runReciever() {
 			}
 
 			if PacketCodec(pkt).IsInvalid() {
-				err = malformedFrame
-
-				goto exit
+				return malformedFrame
 			}
 
 			p := PacketCodec(pkt)
@@ -676,16 +678,12 @@ func (conn *conn) runReciever() {
 		for {
 			p := PacketCodec(pkt)
 			if p.IsInvalid() {
-				err = malformedFrame
-
-				goto exit
+				return malformedFrame
 			}
 
 			if off := p.NextCommand(); off != 0 {
 				if off < 64 || int(off) > len(pkt) {
-					err = malformedFrame
-
-					goto exit
+					return malformedFrame
 				}
 				pkt, next = pkt[:off], pkt[off:]
 			} else {
@@ -708,8 +706,11 @@ func (conn *conn) runReciever() {
 			pkt = next
 		}
 	}
+}
 
-exit:
+func (conn *conn) runReciever() {
+	err := conn.receive()
+
 	select {
 	case <-conn.rdone:
 		// A logoff closed the transport. The connection is closed all the same,

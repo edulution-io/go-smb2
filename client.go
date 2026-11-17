@@ -506,7 +506,19 @@ func (fs *Share) remove(name string) error {
 	return nil
 }
 
+// Rename renames oldpath to newpath. Unlike os.Rename it refuses an existing
+// newpath with os.ErrExist; RenameReplace overwrites it.
 func (fs *Share) Rename(oldpath, newpath string) error {
+	return fs.rename(oldpath, newpath, 0)
+}
+
+// RenameReplace renames oldpath to newpath, replacing newpath if it exists, in
+// a single request, so newpath is never missing in between.
+func (fs *Share) RenameReplace(oldpath, newpath string) error {
+	return fs.rename(oldpath, newpath, 1)
+}
+
+func (fs *Share) rename(oldpath, newpath string, replaceIfExists uint8) error {
 	oldpath = normPath(oldpath)
 	newpath = normPath(newpath)
 
@@ -539,7 +551,7 @@ func (fs *Share) Rename(oldpath, newpath string) error {
 		FileInfoClass:         FileRenameInformation,
 		AdditionalInformation: 0,
 		Input: &FileRenameInformationType2Encoder{
-			ReplaceIfExists: 0,
+			ReplaceIfExists: replaceIfExists,
 			RootDirectory:   0,
 			FileName:        newpath,
 		},
@@ -1196,7 +1208,7 @@ func (f *File) Read(b []byte) (n int, err error) {
 
 	off, err := f.seek(0, io.SeekCurrent)
 	if err != nil {
-		return -1, &os.PathError{Op: "read", Path: f.name, Err: err}
+		return 0, &os.PathError{Op: "read", Path: f.name, Err: err}
 	}
 
 	n, err = f.readAt(b, off)
@@ -1218,7 +1230,7 @@ func (f *File) Read(b []byte) (n int, err error) {
 // ReadAt implements io.ReaderAt.
 func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
 	if off < 0 {
-		return -1, os.ErrInvalid
+		return 0, os.ErrInvalid
 	}
 
 	n, err = f.readAt(b, off)
@@ -1275,7 +1287,7 @@ func (f *File) maxTransactSize() int {
 
 func (f *File) readAt(b []byte, off int64) (n int, err error) {
 	if off < 0 {
-		return -1, os.ErrInvalid
+		return 0, os.ErrInvalid
 	}
 
 	if !f.pipelined() || len(b) <= f.maxReadSize() {
@@ -1298,7 +1310,7 @@ func (f *File) readAtSerial(b []byte, off int64) (n int, err error) {
 				if err, ok := err.(*ResponseError); ok && NtStatus(err.Code) == STATUS_END_OF_FILE && n != 0 {
 					return n, nil
 				}
-				return 0, err
+				return n, err
 			}
 
 			n += copy(b[n:], bs)
@@ -1312,7 +1324,7 @@ func (f *File) readAtSerial(b []byte, off int64) (n int, err error) {
 				if err, ok := err.(*ResponseError); ok && NtStatus(err.Code) == STATUS_END_OF_FILE && n != 0 {
 					return n, nil
 				}
-				return 0, err
+				return n, err
 			}
 
 			n += copy(b[n:], bs)
@@ -1505,17 +1517,17 @@ func (f *File) seek(offset int64, whence int) (ret int64, err error) {
 
 		infoBytes, err := f.queryInfo(req)
 		if err != nil {
-			return -1, err
+			return 0, err
 		}
 
 		info := FileStandardInformationDecoder(infoBytes)
 		if info.IsInvalid() {
-			return -1, &InvalidResponseError{"broken query info response format"}
+			return 0, &InvalidResponseError{"broken query info response format"}
 		}
 
 		f.offset = offset + info.EndOfFile()
 	default:
-		return -1, os.ErrInvalid
+		return 0, os.ErrInvalid
 	}
 
 	return f.offset, nil
@@ -1747,7 +1759,7 @@ func (f *File) Write(b []byte) (n int, err error) {
 
 	off, err := f.seek(0, io.SeekCurrent)
 	if err != nil {
-		return -1, &os.PathError{Op: "write", Path: f.name, Err: err}
+		return 0, &os.PathError{Op: "write", Path: f.name, Err: err}
 	}
 
 	n, err = f.writeAt(b, off)
@@ -1774,7 +1786,7 @@ func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
 
 func (f *File) writeAt(b []byte, off int64) (n int, err error) {
 	if off < 0 {
-		return -1, os.ErrInvalid
+		return 0, os.ErrInvalid
 	}
 
 	if len(b) == 0 {
@@ -1812,7 +1824,7 @@ func (f *File) writeAtSerial(b []byte, off int64) (n int, err error) {
 		case len(b)-n <= maxWriteSize:
 			m, err := f.writeAtChunk(b[n:], int64(n)+off)
 			if err != nil {
-				return -1, err
+				return n, err
 			}
 			if m == 0 {
 				return -1, io.ErrShortWrite
@@ -1822,7 +1834,7 @@ func (f *File) writeAtSerial(b []byte, off int64) (n int, err error) {
 		default:
 			m, err := f.writeAtChunk(b[n:n+maxWriteSize], int64(n)+off)
 			if err != nil {
-				return -1, err
+				return n, err
 			}
 			if m == 0 {
 				return -1, io.ErrShortWrite
@@ -2231,7 +2243,7 @@ func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
 	defer lockOffsets(f, wf)()
 
 	fail := func(err error) (bool, int64, error) {
-		return true, -1, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: err}
+		return true, n, &os.LinkError{Op: "copy", Old: f.name, New: wf.name, Err: err}
 	}
 
 	req := &IoctlRequest{
@@ -2246,7 +2258,7 @@ func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
 	output, err := f.ioctl(req)
 	if err != nil {
 		if copychunkUnsupported(err) {
-			return false, -1, nil
+			return false, 0, nil
 		}
 
 		return fail(err)
@@ -2321,7 +2333,7 @@ func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
 				// caller left them and the copy can be streamed instead.
 				_, _ = f.seek(off, io.SeekStart)
 				_, _ = wf.seek(woff, io.SeekStart)
-				return false, -1, nil
+				return false, 0, nil
 			}
 
 			return fail(err)
@@ -2335,6 +2347,7 @@ func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
 		if err := plan.advance(int64(c.TotalBytesWritten()), planned); err != nil {
 			return fail(err)
 		}
+		n = plan.copied
 	}
 
 	// A streamed copy leaves the destination advanced by what it received; the

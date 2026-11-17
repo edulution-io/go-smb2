@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -491,6 +492,46 @@ func TestRename(t *testing.T) {
 	}
 	if string(bs) != "testContent" {
 		t.Error("unexpected content:", string(bs))
+	}
+}
+
+// TestRenameReplace pins the split fileproxy relies on: Rename refuses an
+// existing target, which WebDAV's Overwrite: F needs, while RenameReplace
+// swaps it in one request, which atomic uploads need.
+func TestRenameReplace(t *testing.T) {
+	if fs == nil {
+		t.Skip()
+	}
+	testDir := fmt.Sprintf("testDir-%d-TestRenameReplace", os.Getpid())
+	if err := fs.Mkdir(testDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.RemoveAll(testDir)
+
+	src, dst := testDir+`\upload.tmp`, testDir+`\target`
+	if err := fs.WriteFile(src, []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.WriteFile(dst, []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fs.Rename(src, dst); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("Rename onto an existing target = %v, want os.ErrExist", err)
+	}
+
+	if err := fs.RenameReplace(src, dst); err != nil {
+		t.Fatalf("RenameReplace = %v", err)
+	}
+	if _, err := fs.Stat(src); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Stat(source) = %v, want os.ErrNotExist", err)
+	}
+	bs, err := fs.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(bs) != "new" {
+		t.Errorf("target holds %q, want %q", bs, "new")
 	}
 }
 

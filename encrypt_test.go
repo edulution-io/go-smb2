@@ -41,7 +41,7 @@ func encryptingConn(tb testing.TB, cipherId uint16) *conn {
 // prepareRequest registers and encodes req as sendWith does, without sending.
 func prepareRequest(c *conn, req Packet) (*requestResponse, error) {
 	rr := c.registerRequest(req, nil, context.Background())
-	return rr, c.encodeRequest(rr, req, nil)
+	return rr, c.encodeRequest(rr, req)
 }
 
 func writeRequest(size int) *WriteRequest {

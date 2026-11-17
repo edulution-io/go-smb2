@@ -191,7 +191,7 @@ func TestSessionSetupIgnoresIntermediateFlags(t *testing.T) {
 				account:             openAccount(64),
 				rdone:               make(chan struct{}, 1),
 				wdone:               make(chan struct{}, 1),
-				write:               make(chan *outgoing, 1),
+				write:               make(chan *outgoing),
 				dialect:             SMB210,
 				requireSigning:      true,
 			}

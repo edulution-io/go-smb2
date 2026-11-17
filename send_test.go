@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/aes"
 	"hash"
+	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/edulution-io/go-smb2/internal/crypto/cmac"
 
@@ -28,7 +30,7 @@ func sendingConn(tb testing.TB, encrypt bool) *conn {
 	c.t = newFakeTransport(func([]byte) error { return nil })
 	c.rdone = make(chan struct{}, 1)
 	c.wdone = make(chan struct{}, 1)
-	c.write = make(chan *outgoing, 1)
+	c.write = make(chan *outgoing)
 	go c.runSender()
 	tb.Cleanup(func() { close(c.wdone) })
 	return c
@@ -135,6 +137,75 @@ func TestDerivedSignerMatchesVerifier(t *testing.T) {
 		pkt := s.sign(newResponse(t, 1))
 		if !s.verify(pkt) {
 			t.Errorf("dialect %#x: the verifier rejects what the signer signed", dialect)
+		}
+	}
+}
+
+// A request is visible to the receiver as soon as it is registered, before it
+// is encoded. If it only learned then that it is encrypted, a plaintext
+// response injected in between passed the encrypted-response check.
+func TestRequestRegisteredWithItsEncryption(t *testing.T) {
+	c := encryptingConn(t, AES128GCM)
+
+	rr := c.registerRequest(writeRequest(16), nil, context.Background())
+	if !rr.encrypted {
+		t.Fatal("request registered without its encryption requirement")
+	}
+
+	if err := c.tryHandle(newResponse(t, rr.msgId), nil, false); err != nil {
+		t.Fatal(err)
+	}
+	<-rr.recv
+	if rr.err == nil {
+		t.Fatal("plaintext response accepted while the request was being encoded")
+	}
+}
+
+// encodeBlocker holds a request in Encode until release is closed.
+type encodeBlocker struct {
+	*LogoffRequest
+	encoding, release chan struct{}
+}
+
+func (r encodeBlocker) Encode(pkt []byte) {
+	close(r.encoding)
+	<-r.release
+	r.LogoffRequest.Encode(pkt)
+}
+
+// The receiver can stop while a request is being encoded, and the sender with
+// it. With conn.write buffered, handing the request over still succeeded and
+// sendWith then waited for a write result that never came.
+func TestSendFailsOnceTheSenderStopped(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		c := newConn(newFakeTransport(func([]byte) error { return nil }), openAccount(64))
+		c.sequenceWindow = 1
+
+		req := encodeBlocker{newRequest().(*LogoffRequest), make(chan struct{}), make(chan struct{})}
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := c.sendWith(req, nil, context.Background())
+			done <- err
+		}()
+
+		<-req.encoding
+
+		// What the receiver does when it stops; the sender stops with it.
+		c.m.Lock()
+		c.err = &TransportError{net.ErrClosed}
+		close(c.wdone)
+		c.m.Unlock()
+
+		close(req.release)
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("request sent without a sender")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("run %d: sendWith hangs after the sender stopped", i)
 		}
 	}
 }

@@ -92,7 +92,6 @@ func buildSecurityDescriptor(control uint16, owner, group, sacl, dacl []byte) []
 	if len(dacl) > 0 {
 		binary.LittleEndian.PutUint32(b[16:20], off)
 		copy(b[off:], dacl)
-		off += uint32(len(dacl))
 	}
 	return b
 }

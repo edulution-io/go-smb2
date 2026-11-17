@@ -141,7 +141,7 @@ func (c *Session) ListSharenames() ([]string, error) {
 		OutputOffset:      0,
 		OutputCount:       0,
 		MaxInputResponse:  0,
-		MaxOutputResponse: 4280,
+		MaxOutputResponse: msrpc.MaxFragSize,
 		Flags:             SMB2_0_IOCTL_IS_FSCTL,
 		Input: &msrpc.Bind{
 			CallId: callId,
@@ -197,23 +197,21 @@ func (c *Session) ListSharenames() ([]string, error) {
 	return r2.ShareNameList(), nil
 }
 
-const (
-	shareEnumFragmentSize = 4280 // max recv frag of the bind
-	maxShareEnumFragments = 256  // bounds a response the server keeps declaring incomplete
-)
+// maxShareEnumFragments bounds a response the server keeps declaring incomplete.
+const maxShareEnumFragments = 256
 
 // readShareEnum reads the rest of a share enumeration that did not fit into the
 // ioctl output. Both the output and the fragments come from the server.
 func readShareEnum(output []byte, callId uint32, read func([]byte) (int, error)) (msrpc.NetShareEnumAllResponseDecoder, error) {
 	broken := &InvalidResponseError{"broken net share enum response format"}
 
-	if len(output) > shareEnumFragmentSize {
+	if len(output) > msrpc.MaxFragSize {
 		return nil, broken
 	}
 
-	buf := make([]byte, shareEnumFragmentSize)
+	buf := make([]byte, msrpc.MaxFragSize)
 
-	n, err := read(buf[:shareEnumFragmentSize-len(output)])
+	n, err := read(buf[:msrpc.MaxFragSize-len(output)])
 	if err != nil {
 		return nil, err
 	}

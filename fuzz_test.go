@@ -12,7 +12,8 @@ import (
 func FuzzParseSecurityDescriptor(f *testing.F) {
 	f.Add([]byte{})
 	f.Add(make([]byte, 20))
-	f.Add([]byte{1, 0, 4, 0x80, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0})
+	system := buildSID(1, 5, 18)
+	f.Add(buildSecurityDescriptor(0x0004, system, nil, nil, buildACL(2, buildACE(0, 0, 0x001F01FF, system))))
 
 	f.Fuzz(func(t *testing.T, b []byte) {
 		_, _ = parseSecurityDescriptor(b)
@@ -22,7 +23,7 @@ func FuzzParseSecurityDescriptor(f *testing.F) {
 
 func FuzzParseDirectoryEntries(f *testing.F) {
 	f.Add([]byte{})
-	f.Add(make([]byte, 104))
+	f.Add(dirInfoEntry("a.txt", 0))
 
 	f.Fuzz(func(t *testing.T, b []byte) {
 		_, _ = parseDirectoryEntries(b)
@@ -39,7 +40,7 @@ func FuzzEvalSymlinkError(f *testing.F) {
 }
 
 func FuzzCopychunkLimitsFrom(f *testing.F) {
-	f.Add(make([]byte, 12))
+	f.Add(copychunkResponse(4, 512, 2048))
 
 	f.Fuzz(func(t *testing.T, b []byte) {
 		_, _ = copychunkLimitsFrom(b)

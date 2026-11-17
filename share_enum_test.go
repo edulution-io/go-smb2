@@ -25,10 +25,10 @@ func shareEnumFragment(n int, callId, count uint32) []byte {
 
 func TestReadShareEnum(t *testing.T) {
 	const callId = 3
+	noRead := func([]byte) (int, error) { return 0, nil }
 
 	t.Run("complete", func(t *testing.T) {
-		read := func(b []byte) (int, error) { return 0, nil }
-		r, err := readShareEnum(shareEnumFragment(48, callId, 0), callId, read)
+		r, err := readShareEnum(shareEnumFragment(48, callId, 0), callId, noRead)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -37,18 +37,15 @@ func TestReadShareEnum(t *testing.T) {
 		}
 	})
 
-	// The ioctl output is not bounded by MaxOutputResponse, so an output longer
-	// than a fragment made the read buffer slice negative and panicked.
+	// The ioctl output is not bounded by MaxOutputResponse.
 	t.Run("output longer than a fragment", func(t *testing.T) {
-		read := func(b []byte) (int, error) { return 0, nil }
-		if _, err := readShareEnum(shareEnumFragment(shareEnumFragmentSize+1, callId, 0), callId, read); err == nil {
+		if _, err := readShareEnum(shareEnumFragment(msrpc.MaxFragSize+1, callId, 0), callId, noRead); err == nil {
 			t.Fatal("oversized output accepted")
 		}
 	})
 
-	// A server declaring more entries than it ever sends kept the client reading
-	// without end: growing the buffer, or spinning on header-only fragments.
-	for _, size := range []int{shareEnumFragmentSize, 24} {
+	// A server may declare more entries than it ever sends, in full or header-only fragments.
+	for _, size := range []int{msrpc.MaxFragSize, 24} {
 		t.Run("never complete/"+strconv.Itoa(size), func(t *testing.T) {
 			reads := 0
 			read := func(b []byte) (int, error) {
@@ -65,8 +62,7 @@ func TestReadShareEnum(t *testing.T) {
 	}
 
 	t.Run("wrong call id", func(t *testing.T) {
-		read := func(b []byte) (int, error) { return 0, nil }
-		if _, err := readShareEnum(shareEnumFragment(48, callId+1, 0), callId, read); err == nil {
+		if _, err := readShareEnum(shareEnumFragment(48, callId+1, 0), callId, noRead); err == nil {
 			t.Fatal("foreign call id accepted")
 		}
 	})

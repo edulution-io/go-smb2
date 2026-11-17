@@ -25,6 +25,9 @@ const (
 	RPC_PACKET_FLAG_FIRST = 0x01
 	RPC_PACKET_FLAG_LAST  = 0x02
 
+	// MaxFragSize is the max xmit and max recv fragment size the binds offer.
+	MaxFragSize = 4280
+
 	SRVSVC_VERSION       = 3
 	SRVSVC_VERSION_MINOR = 0
 
@@ -58,15 +61,15 @@ func (r *Bind) Encode(b []byte) {
 	b[6] = 0
 	b[7] = 0
 
-	le.PutUint16(b[8:10], 72)        // frag length
-	le.PutUint16(b[10:12], 0)        // auth length
-	le.PutUint32(b[12:16], r.CallId) // call id
-	le.PutUint16(b[16:18], 4280)     // max xmit frag
-	le.PutUint16(b[18:20], 4280)     // max recv frag
-	le.PutUint32(b[20:24], 0)        // assoc group
-	le.PutUint32(b[24:28], 1)        // num ctx items
-	le.PutUint16(b[28:30], 0)        // ctx item[1] .context id
-	le.PutUint16(b[30:32], 1)        // ctx item[1] .num trans items
+	le.PutUint16(b[8:10], 72)           // frag length
+	le.PutUint16(b[10:12], 0)           // auth length
+	le.PutUint32(b[12:16], r.CallId)    // call id
+	le.PutUint16(b[16:18], MaxFragSize) // max xmit frag
+	le.PutUint16(b[18:20], MaxFragSize) // max recv frag
+	le.PutUint32(b[20:24], 0)           // assoc group
+	le.PutUint32(b[24:28], 1)           // num ctx items
+	le.PutUint16(b[28:30], 0)           // ctx item[1] .context id
+	le.PutUint16(b[30:32], 1)           // ctx item[1] .num trans items
 
 	_, _ = hex.Decode(b[32:48], SRVSVC_UUID)
 	le.PutUint16(b[48:50], SRVSVC_VERSION)

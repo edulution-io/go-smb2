@@ -373,3 +373,9 @@ func sliceForAppend(in []byte, n int) (head, tail []byte) {
 	tail = head[len(in):]
 	return
 }
+
+// exchangesKey reports whether a random session key travels in the
+// AUTHENTICATE_MESSAGE: MS-NLMP 3.1.5.1.2 requires SIGN or SEAL besides KEY_EXCH.
+func exchangesKey(flags uint32) bool {
+	return flags&NTLMSSP_NEGOTIATE_KEY_EXCH != 0 && flags&(NTLMSSP_NEGOTIATE_SIGN|NTLMSSP_NEGOTIATE_SEAL) != 0
+}

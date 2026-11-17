@@ -265,7 +265,7 @@ func (c *Client) Authenticate(cmsg []byte) (amsg []byte, err error) {
 
 		keyExchangeKey := sessionBaseKey // if ntlm version == 2
 
-		if flags&NTLMSSP_NEGOTIATE_KEY_EXCH != 0 {
+		if exchangesKey(flags) {
 			session.exportedSessionKey = make([]byte, 16)
 			_, err := rand.Read(session.exportedSessionKey)
 			if err != nil {

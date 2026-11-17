@@ -1,12 +1,22 @@
 package smb2
 
 import (
+	"bytes"
+	"context"
 	"crypto/aes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/asn1"
+	"net"
 	"slices"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/edulution-io/go-smb2/internal/crypto/cmac"
+	"github.com/edulution-io/go-smb2/internal/spnego"
 
+	. "github.com/edulution-io/go-smb2/internal/erref"
 	. "github.com/edulution-io/go-smb2/internal/smb2"
 )
 
@@ -81,6 +91,122 @@ func TestVerifySessionSetup(t *testing.T) {
 			}
 			if !tt.ok && err == nil {
 				t.Fatal("response accepted")
+			}
+		})
+	}
+}
+
+// scriptedTransport answers every written request with what reply returns.
+type scriptedTransport struct {
+	reply  func(req []byte) []byte
+	in     chan []byte
+	next   []byte
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newScriptedTransport(reply func(req []byte) []byte) *scriptedTransport {
+	return &scriptedTransport{reply: reply, in: make(chan []byte, 4), closed: make(chan struct{})}
+}
+
+func (t *scriptedTransport) Write(p []byte) (int, error) {
+	t.in <- t.reply(p)
+	return len(p), nil
+}
+
+func (t *scriptedTransport) ReadSize() (int, error) {
+	select {
+	case t.next = <-t.in:
+		return len(t.next), nil
+	case <-t.closed:
+		return -1, net.ErrClosed
+	}
+}
+
+func (t *scriptedTransport) Read(p []byte) (int, error) {
+	return copy(p, t.next), nil
+}
+
+func (t *scriptedTransport) Close() error {
+	t.once.Do(func() { close(t.closed) })
+	return nil
+}
+
+type fakeInitiator struct{ key []byte }
+
+func (i *fakeInitiator) oid() asn1.ObjectIdentifier      { return spnego.NlmpOid }
+func (i *fakeInitiator) initSecContext() ([]byte, error) { return []byte("negotiate"), nil }
+func (i *fakeInitiator) acceptSecContext(sc []byte) ([]byte, error) {
+	return []byte("authenticate"), nil
+}
+func (i *fakeInitiator) sum(bs []byte) []byte { return nil }
+func (i *fakeInitiator) sessionKey() []byte   { return i.key }
+
+// The flags of the intermediate SESSION_SETUP response used to decide whether
+// keys were derived, so a guest flag there followed by a signed final response
+// left the verifier nil and panicked.
+func TestSessionSetupIgnoresIntermediateFlags(t *testing.T) {
+	sessionKey := bytes.Repeat([]byte{0x11}, 16)
+
+	for _, tt := range []struct {
+		name    string
+		signKey []byte
+		ok      bool
+	}{
+		{name: "signed with the session key", signKey: sessionKey, ok: true},
+		{name: "signed with another key", signKey: bytes.Repeat([]byte{0x22}, 16)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &session{conn: &conn{dialect: SMB210}, signer: hmac.New(sha256.New, tt.signKey)}
+
+			tr := newScriptedTransport(func(req []byte) []byte {
+				res := &SessionSetupResponse{}
+				res.Flags = SMB2_FLAGS_SERVER_TO_REDIR
+				res.MessageId = PacketCodec(req).MessageId()
+				res.SessionId = 1
+				res.CreditRequestResponse = 1
+
+				if res.MessageId == 0 {
+					token, err := spnego.EncodeNegTokenResp(1, spnego.NlmpOid, []byte("challenge"), nil)
+					if err != nil {
+						panic(err)
+					}
+					res.Status = uint32(STATUS_MORE_PROCESSING_REQUIRED)
+					res.SessionFlags = SMB2_SESSION_FLAG_IS_GUEST
+					res.SecurityBuffer = token
+				}
+
+				pkt := make([]byte, res.Size())
+				res.Encode(pkt)
+				if res.MessageId != 0 {
+					pkt = server.sign(pkt)
+				}
+				return pkt
+			})
+
+			c := &conn{
+				t:                   tr,
+				outstandingRequests: newOutstandingRequests(),
+				account:             openAccount(64),
+				rdone:               make(chan struct{}, 1),
+				wdone:               make(chan struct{}, 1),
+				write:               make(chan *outgoing, 1),
+				dialect:             SMB210,
+				requireSigning:      true,
+			}
+			go c.runSender()
+			go c.runReciever()
+			t.Cleanup(func() { _ = tr.Close() })
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, err := sessionSetup(c, &fakeInitiator{key: sessionKey}, ctx)
+			if tt.ok && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !tt.ok && err == nil {
+				t.Fatal("session accepted")
 			}
 		})
 	}

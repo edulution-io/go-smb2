@@ -115,107 +115,6 @@ func sessionSetup(conn *conn, i Initiator, ctx context.Context) (*session, error
 		return nil, err
 	}
 
-	if s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 {
-		sessionKey := spnego.sessionKey()
-
-		switch conn.dialect {
-		case SMB202, SMB210:
-			s.signer = hmac.New(sha256.New, sessionKey)
-			s.verifier = hmac.New(sha256.New, sessionKey)
-		case SMB300, SMB302:
-			signingKey := kdf(sessionKey, []byte("SMB2AESCMAC\x00"), []byte("SmbSign\x00"))
-			ciph, err := aes.NewCipher(signingKey)
-			if err != nil {
-				return nil, &InternalError{err.Error()}
-			}
-			s.signer = cmac.New(ciph)
-			s.verifier = cmac.New(ciph)
-
-			// s.applicationKey = kdf(sessionKey, []byte("SMB2APP\x00"), []byte("SmbRpc\x00"))
-
-			encryptionKey := kdf(sessionKey, []byte("SMB2AESCCM\x00"), []byte("ServerIn \x00"))
-			decryptionKey := kdf(sessionKey, []byte("SMB2AESCCM\x00"), []byte("ServerOut\x00"))
-
-			ciph, err = aes.NewCipher(encryptionKey)
-			if err != nil {
-				return nil, &InternalError{err.Error()}
-			}
-			s.encrypter, err = ccm.NewCCMWithNonceAndTagSizes(ciph, 11, 16)
-			if err != nil {
-				return nil, &InternalError{err.Error()}
-			}
-
-			ciph, err = aes.NewCipher(decryptionKey)
-			if err != nil {
-				return nil, &InternalError{err.Error()}
-			}
-			s.decrypter, err = ccm.NewCCMWithNonceAndTagSizes(ciph, 11, 16)
-			if err != nil {
-				return nil, &InternalError{err.Error()}
-			}
-		case SMB311:
-			switch conn.preauthIntegrityHashId {
-			case SHA512:
-				h := sha512.New()
-				h.Write(s.preauthIntegrityHashValue[:])
-				h.Write(rr.pkt)
-				h.Sum(s.preauthIntegrityHashValue[:0])
-			}
-
-			signingKey := kdf(sessionKey, []byte("SMBSigningKey\x00"), s.preauthIntegrityHashValue[:])
-			ciph, err := aes.NewCipher(signingKey)
-			if err != nil {
-				return nil, &InternalError{err.Error()}
-			}
-			s.signer = cmac.New(ciph)
-			s.verifier = cmac.New(ciph)
-
-			// s.applicationKey = kdf(sessionKey, []byte("SMBAppKey\x00"), preauthIntegrityHashValue)
-
-			encryptionKey := kdf(sessionKey, []byte("SMBC2SCipherKey\x00"), s.preauthIntegrityHashValue[:])
-			decryptionKey := kdf(sessionKey, []byte("SMBS2CCipherKey\x00"), s.preauthIntegrityHashValue[:])
-
-			switch s.cipherId {
-			case AES128CCM:
-				ciph, err := aes.NewCipher(encryptionKey)
-				if err != nil {
-					return nil, &InternalError{err.Error()}
-				}
-				s.encrypter, err = ccm.NewCCMWithNonceAndTagSizes(ciph, 11, 16)
-				if err != nil {
-					return nil, &InternalError{err.Error()}
-				}
-
-				ciph, err = aes.NewCipher(decryptionKey)
-				if err != nil {
-					return nil, &InternalError{err.Error()}
-				}
-				s.decrypter, err = ccm.NewCCMWithNonceAndTagSizes(ciph, 11, 16)
-				if err != nil {
-					return nil, &InternalError{err.Error()}
-				}
-			case AES128GCM:
-				ciph, err := aes.NewCipher(encryptionKey)
-				if err != nil {
-					return nil, &InternalError{err.Error()}
-				}
-				s.encrypter, err = cipher.NewGCMWithNonceSize(ciph, 12)
-				if err != nil {
-					return nil, &InternalError{err.Error()}
-				}
-
-				ciph, err = aes.NewCipher(decryptionKey)
-				if err != nil {
-					return nil, &InternalError{err.Error()}
-				}
-				s.decrypter, err = cipher.NewGCMWithNonceSize(ciph, 12)
-				if err != nil {
-					return nil, &InternalError{err.Error()}
-				}
-			}
-		}
-	}
-
 	pkt, err = s.recv(rr)
 	if err != nil {
 		return nil, err
@@ -235,7 +134,15 @@ func sessionSetup(conn *conn, i Initiator, ctx context.Context) (*session, error
 		return nil, &InvalidResponseError{"broken session setup response format"}
 	}
 
+	// Only the final response's flags count; trusting the intermediate ones
+	// would let them skip key derivation for a session that turns out signed.
 	s.sessionFlags = r.SessionFlags()
+
+	if s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 {
+		if err := s.deriveKeys(spnego.sessionKey(), rr.pkt); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := s.verifySessionSetup(pkt); err != nil {
 		return nil, err
@@ -245,6 +152,109 @@ func sessionSetup(conn *conn, i Initiator, ctx context.Context) (*session, error
 	s.enableSession()
 
 	return s, nil
+}
+
+// deriveKeys sets up signing and encryption from the session key. finalReq is
+// the last SESSION_SETUP request, which closes the SMB 3.1.1 preauth hash.
+func (s *session) deriveKeys(sessionKey, finalReq []byte) error {
+	switch s.dialect {
+	case SMB202, SMB210:
+		s.signer = hmac.New(sha256.New, sessionKey)
+		s.verifier = hmac.New(sha256.New, sessionKey)
+	case SMB300, SMB302:
+		signingKey := kdf(sessionKey, []byte("SMB2AESCMAC\x00"), []byte("SmbSign\x00"))
+		ciph, err := aes.NewCipher(signingKey)
+		if err != nil {
+			return &InternalError{err.Error()}
+		}
+		s.signer = cmac.New(ciph)
+		s.verifier = cmac.New(ciph)
+
+		// s.applicationKey = kdf(sessionKey, []byte("SMB2APP\x00"), []byte("SmbRpc\x00"))
+
+		encryptionKey := kdf(sessionKey, []byte("SMB2AESCCM\x00"), []byte("ServerIn \x00"))
+		decryptionKey := kdf(sessionKey, []byte("SMB2AESCCM\x00"), []byte("ServerOut\x00"))
+
+		ciph, err = aes.NewCipher(encryptionKey)
+		if err != nil {
+			return &InternalError{err.Error()}
+		}
+		s.encrypter, err = ccm.NewCCMWithNonceAndTagSizes(ciph, 11, 16)
+		if err != nil {
+			return &InternalError{err.Error()}
+		}
+
+		ciph, err = aes.NewCipher(decryptionKey)
+		if err != nil {
+			return &InternalError{err.Error()}
+		}
+		s.decrypter, err = ccm.NewCCMWithNonceAndTagSizes(ciph, 11, 16)
+		if err != nil {
+			return &InternalError{err.Error()}
+		}
+	case SMB311:
+		switch s.preauthIntegrityHashId {
+		case SHA512:
+			h := sha512.New()
+			h.Write(s.preauthIntegrityHashValue[:])
+			h.Write(finalReq)
+			h.Sum(s.preauthIntegrityHashValue[:0])
+		}
+
+		signingKey := kdf(sessionKey, []byte("SMBSigningKey\x00"), s.preauthIntegrityHashValue[:])
+		ciph, err := aes.NewCipher(signingKey)
+		if err != nil {
+			return &InternalError{err.Error()}
+		}
+		s.signer = cmac.New(ciph)
+		s.verifier = cmac.New(ciph)
+
+		// s.applicationKey = kdf(sessionKey, []byte("SMBAppKey\x00"), preauthIntegrityHashValue)
+
+		encryptionKey := kdf(sessionKey, []byte("SMBC2SCipherKey\x00"), s.preauthIntegrityHashValue[:])
+		decryptionKey := kdf(sessionKey, []byte("SMBS2CCipherKey\x00"), s.preauthIntegrityHashValue[:])
+
+		switch s.cipherId {
+		case AES128CCM:
+			ciph, err := aes.NewCipher(encryptionKey)
+			if err != nil {
+				return &InternalError{err.Error()}
+			}
+			s.encrypter, err = ccm.NewCCMWithNonceAndTagSizes(ciph, 11, 16)
+			if err != nil {
+				return &InternalError{err.Error()}
+			}
+
+			ciph, err = aes.NewCipher(decryptionKey)
+			if err != nil {
+				return &InternalError{err.Error()}
+			}
+			s.decrypter, err = ccm.NewCCMWithNonceAndTagSizes(ciph, 11, 16)
+			if err != nil {
+				return &InternalError{err.Error()}
+			}
+		case AES128GCM:
+			ciph, err := aes.NewCipher(encryptionKey)
+			if err != nil {
+				return &InternalError{err.Error()}
+			}
+			s.encrypter, err = cipher.NewGCMWithNonceSize(ciph, 12)
+			if err != nil {
+				return &InternalError{err.Error()}
+			}
+
+			ciph, err = aes.NewCipher(decryptionKey)
+			if err != nil {
+				return &InternalError{err.Error()}
+			}
+			s.decrypter, err = cipher.NewGCMWithNonceSize(ciph, 12)
+			if err != nil {
+				return &InternalError{err.Error()}
+			}
+		}
+	}
+
+	return nil
 }
 
 // verifySessionSetup checks the final SESSION_SETUP response, which the

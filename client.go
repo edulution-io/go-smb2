@@ -358,6 +358,8 @@ func (fs *Share) OpenFile(name string, flag int, perm os.FileMode) (*File, error
 		return nil, &os.PathError{Op: "open", Path: name, Err: err}
 	}
 	if flag&os.O_APPEND != 0 {
+		f.appendOnly = true
+
 		if _, err := f.seek(0, io.SeekEnd); err != nil {
 			_ = f.close()
 			return nil, &os.PathError{Op: "open", Path: name, Err: err}
@@ -1113,6 +1115,10 @@ type File struct {
 
 	offset int64
 
+	// appendOnly is set for O_APPEND: the handle has FILE_APPEND_DATA without
+	// FILE_WRITE_DATA, so the server may append each write whatever its offset.
+	appendOnly bool
+
 	// id orders the offset locks when a copy holds two handles; see
 	// lockOffsets. newFile assigns it, so no two handles share one.
 	id uint64
@@ -1272,6 +1278,14 @@ func (f *File) readAt(b []byte, off int64) (n int, err error) {
 		return -1, os.ErrInvalid
 	}
 
+	if !f.pipelined() || len(b) <= f.maxReadSize() {
+		return f.readAtSerial(b, off)
+	}
+
+	return f.readAtPipelined(b, off)
+}
+
+func (f *File) readAtSerial(b []byte, off int64) (n int, err error) {
 	maxReadSize := f.maxReadSize()
 
 	for {
@@ -1310,17 +1324,64 @@ func (f *File) readAt(b []byte, off int64) (n int, err error) {
 	}
 }
 
+// readAtPipelined reads with up to maxChunksInFlight requests in flight and
+// returns what readAtSerial would: the bytes up to the first short chunk.
+func (f *File) readAtPipelined(b []byte, off int64) (n int, err error) {
+	// Each chunk is copied into its own part of b as soon as it arrives, so
+	// no more than maxChunksInFlight response buffers are held at a time.
+	chunks, err := f.dispatchChunks(len(b), f.maxReadSize(), func(c *chunk, creditCharge uint16) bool {
+		var data []byte
+		data, c.err = f.readLoaned(creditCharge, c.size, off+int64(c.start))
+		c.done = copy(b[c.start:c.start+c.size], data)
+		return c.err != nil || c.done < c.size
+	})
+
+	for _, c := range chunks {
+		if c.err != nil {
+			if rerr, ok := c.err.(*ResponseError); ok && NtStatus(rerr.Code) == STATUS_END_OF_FILE && n != 0 {
+				return n, nil
+			}
+			return 0, c.err
+		}
+
+		n += c.done
+
+		if c.done < c.size {
+			return n, nil
+		}
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	return n, nil
+}
+
 func (f *File) readAtChunk(n int, off int64) (bs []byte, isEOF bool, err error) {
-	var responded bool
 	creditCharge, m, err := f.fs.loanCredit(n)
+	if err != nil {
+		f.fs.chargeCredit(creditCharge)
+
+		return nil, false, err
+	}
+
+	bs, err = f.readLoaned(creditCharge, m, off)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return bs, len(bs) < m, nil
+}
+
+// readLoaned reads up to m bytes with credits already loaned for them.
+func (f *File) readLoaned(creditCharge uint16, m int, off int64) (bs []byte, err error) {
+	var responded bool
 	defer func() {
 		if err != nil && !responded {
 			f.fs.chargeCredit(creditCharge)
 		}
 	}()
-	if err != nil {
-		return nil, false, err
-	}
 
 	req := &ReadRequest{
 		Padding:         0,
@@ -1339,17 +1400,20 @@ func (f *File) readAtChunk(n int, off int64) (bs []byte, isEOF bool, err error) 
 
 	res, responded, err := f.sendRecvResponded(SMB2_READ, req)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
 	r := ReadResponseDecoder(res)
 	if r.IsInvalid() {
-		return nil, false, &InvalidResponseError{"broken read response format"}
+		return nil, &InvalidResponseError{"broken read response format"}
 	}
 
 	bs = r.Data()
+	if len(bs) > m {
+		return nil, &InvalidResponseError{"read response longer than requested"}
+	}
 
-	return bs, len(bs) < m, nil
+	return bs, nil
 }
 
 func (f *File) Readdir(n int) (fi []os.FileInfo, err error) {
@@ -1717,6 +1781,28 @@ func (f *File) writeAt(b []byte, off int64) (n int, err error) {
 		return 0, nil
 	}
 
+	// Appended chunks land in the order they arrive, so they go one by one.
+	if !f.pipelined() || f.appendOnly || len(b) <= f.maxWriteSize() {
+		return f.writeAtSerial(b, off)
+	}
+
+	// A short chunk leaves a gap; the next round writes again from there.
+	for n < len(b) {
+		m, err := f.writeAtPipelined(b[n:], off+int64(n))
+		if err != nil {
+			return -1, err
+		}
+		if m == 0 {
+			return -1, io.ErrShortWrite
+		}
+
+		n += m
+	}
+
+	return n, nil
+}
+
+func (f *File) writeAtSerial(b []byte, off int64) (n int, err error) {
 	maxWriteSize := f.maxWriteSize()
 
 	for {
@@ -1728,6 +1814,9 @@ func (f *File) writeAt(b []byte, off int64) (n int, err error) {
 			if err != nil {
 				return -1, err
 			}
+			if m == 0 {
+				return -1, io.ErrShortWrite
+			}
 
 			n += m
 		default:
@@ -1735,24 +1824,62 @@ func (f *File) writeAt(b []byte, off int64) (n int, err error) {
 			if err != nil {
 				return -1, err
 			}
+			if m == 0 {
+				return -1, io.ErrShortWrite
+			}
 
 			n += m
 		}
 	}
 }
 
+// writeAtPipelined writes with up to maxChunksInFlight requests in flight and
+// returns how many bytes from the start of b were written without a gap.
+func (f *File) writeAtPipelined(b []byte, off int64) (n int, err error) {
+	chunks, err := f.dispatchChunks(len(b), f.maxWriteSize(), func(c *chunk, creditCharge uint16) bool {
+		c.done, c.err = f.writeLoaned(creditCharge, b[c.start:c.start+c.size], off+int64(c.start))
+		return c.err != nil || c.done < c.size
+	})
+
+	for _, c := range chunks {
+		if c.err != nil {
+			return 0, c.err
+		}
+
+		n += c.done
+
+		if c.done < c.size {
+			return n, nil
+		}
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	return n, nil
+}
+
 // writeAt allows partial write
 func (f *File) writeAtChunk(b []byte, off int64) (n int, err error) {
-	var responded bool
 	creditCharge, m, err := f.fs.loanCredit(len(b))
+	if err != nil {
+		f.fs.chargeCredit(creditCharge)
+
+		return 0, err
+	}
+
+	return f.writeLoaned(creditCharge, b[:m], off)
+}
+
+// writeLoaned writes b with credits already loaned for it.
+func (f *File) writeLoaned(creditCharge uint16, b []byte, off int64) (n int, err error) {
+	var responded bool
 	defer func() {
 		if err != nil && !responded {
 			f.fs.chargeCredit(creditCharge)
 		}
 	}()
-	if err != nil {
-		return 0, err
-	}
 
 	req := &WriteRequest{
 		Flags:            0,
@@ -1760,7 +1887,7 @@ func (f *File) writeAtChunk(b []byte, off int64) (n int, err error) {
 		RemainingBytes:   0,
 		Offset:           uint64(off),
 		WriteChannelInfo: nil,
-		Data:             b[:m],
+		Data:             b,
 	}
 
 	req.FileId = f.fd
@@ -1777,7 +1904,86 @@ func (f *File) writeAtChunk(b []byte, off int64) (n int, err error) {
 		return 0, &InvalidResponseError{"broken write response format"}
 	}
 
+	if int64(r.Count()) > int64(len(b)) {
+		return 0, &InvalidResponseError{"write response counts more than was sent"}
+	}
+
 	return int(r.Count()), nil
+}
+
+// maxChunksInFlight bounds the requests one read or write keeps in flight.
+const maxChunksInFlight = 8
+
+// chunk is one request of a pipelined transfer; start and size are relative
+// to the caller's buffer.
+type chunk struct {
+	start, size int
+	done        int // bytes read or written
+	err         error
+}
+
+// pipelined reports whether a transfer may keep several chunks in flight. On
+// a pipe the chunks are one stream and have to go one after another.
+func (f *File) pipelined() bool {
+	return f.fs.shareType == SMB2_SHARE_TYPE_DISK
+}
+
+// dispatchChunks splits total bytes into chunks of at most maxSize, loans the
+// credits for them in order and runs up to maxChunksInFlight transfers at a
+// time. It stops dispatching once a transfer reports that its chunk ends the
+// transfer, and returns the chunks in order after all of them finished.
+func (f *File) dispatchChunks(total, maxSize int, transfer func(c *chunk, creditCharge uint16) (last bool)) ([]*chunk, error) {
+	var (
+		chunks   []*chunk
+		err      error
+		wg       sync.WaitGroup
+		stop     atomic.Bool
+		inFlight = make(chan struct{}, maxChunksInFlight)
+	)
+
+	for next := 0; next < total; {
+		inFlight <- struct{}{}
+
+		if stop.Load() {
+			<-inFlight
+
+			break
+		}
+
+		creditCharge, granted, e := f.fs.loanCredit(min(total-next, maxSize))
+		if e != nil {
+			f.fs.chargeCredit(creditCharge)
+
+			<-inFlight
+
+			err = e
+
+			break
+		}
+
+		c := &chunk{start: next, size: granted}
+
+		chunks = append(chunks, c)
+
+		next += granted
+
+		wg.Add(1)
+
+		go func() {
+			defer func() {
+				<-inFlight
+				wg.Done()
+			}()
+
+			if transfer(c, creditCharge) {
+				stop.Store(true)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	return chunks, err
 }
 
 func copyBuffer(r io.Reader, w io.Writer, buf []byte) (n int64, err error) {

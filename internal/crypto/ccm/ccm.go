@@ -32,11 +32,11 @@ func NewCCMWithNonceAndTagSizes(c cipher.Block, nonceSize, tagSize int) (cipher.
 		return nil, errors.New("cipher: CCM mode requires 128-bit block cipher")
 	}
 
-	if !(7 <= nonceSize && nonceSize <= 13) {
+	if nonceSize < 7 || nonceSize > 13 {
 		return nil, errors.New("cipher: invalid nonce size")
 	}
 
-	if !(4 <= tagSize && tagSize <= 16 && tagSize&1 == 0) {
+	if tagSize < 4 || tagSize > 16 || tagSize&1 != 0 {
 		return nil, errors.New("cipher: invalid tag size")
 	}
 

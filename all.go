@@ -143,7 +143,7 @@ func (fs *Share) RemoveAll(path string) error {
 	}
 
 	// Close directory, because windows won't remove opened directory.
-	fd.Close()
+	_ = fd.Close()
 
 	// Remove directory.
 	err1 := fs.Remove(path)

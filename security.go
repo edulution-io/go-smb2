@@ -461,7 +461,7 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error
 	if err != nil {
 		return nil, err
 	}
-	defer fs.Umount()
+	defer func() { _ = fs.Umount() }()
 
 	fs = fs.WithContext(s.ctx)
 
@@ -469,7 +469,7 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	callId := rand.Uint32()
 
@@ -580,7 +580,7 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error
 
 	// 4) Close policy handle (best-effort)
 	callId++
-	f.ioctl(&IoctlRequest{
+	_, _ = f.ioctl(&IoctlRequest{
 		CtlCode:           FSCTL_PIPE_TRANSCEIVE,
 		MaxOutputResponse: 256,
 		Flags:             SMB2_0_IOCTL_IS_FSCTL,

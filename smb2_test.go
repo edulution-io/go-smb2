@@ -8,11 +8,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,7 +84,7 @@ func connect(f func()) {
 			goto NO_CONNECTION
 		}
 
-		conn, err := net.Dial(cfg.Transport.Type, fmt.Sprintf("%s:%d", cfg.Transport.Host, cfg.Transport.Port))
+		conn, err := net.Dial(cfg.Transport.Type, net.JoinHostPort(cfg.Transport.Host, strconv.Itoa(cfg.Transport.Port)))
 		if err != nil {
 			panic(err)
 		}
@@ -189,7 +189,7 @@ func TestReaddir(t *testing.T) {
 		t.Error("unexpected content length:", len(fi2))
 	}
 
-	fi2, err = d2.Readdir(1)
+	_, err = d2.Readdir(1)
 	if err != io.EOF {
 		t.Error("unexpected error: ", err)
 	}
@@ -356,7 +356,7 @@ func TestSymlink(t *testing.T) {
 
 		f, err = fs.Open(testDir + `\linkToTestFile`)
 		if err == nil { // if it supports follow-symlink
-			bs, err := ioutil.ReadAll(f)
+			bs, err := io.ReadAll(f)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -485,7 +485,7 @@ func TestRename(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	bs, err := ioutil.ReadAll(f)
+	bs, err := io.ReadAll(f)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -711,7 +711,7 @@ func TestContextError(t *testing.T) {
 		}
 	}
 
-	conn, err := net.Dial(cfg.Transport.Type, fmt.Sprintf("%s:%d", cfg.Transport.Host, cfg.Transport.Port))
+	conn, err := net.Dial(cfg.Transport.Type, net.JoinHostPort(cfg.Transport.Host, strconv.Itoa(cfg.Transport.Port)))
 	if err != nil {
 		panic(err)
 	}

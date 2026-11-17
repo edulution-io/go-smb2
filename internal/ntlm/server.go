@@ -97,7 +97,6 @@ func (s *Server) Challenge(nmsg []byte) (cmsg []byte, err error) {
 		le.PutUint16(cmsg[40:42], uint16(len))
 		le.PutUint16(cmsg[42:44], uint16(len))
 		le.PutUint32(cmsg[44:48], uint32(off))
-		off += len
 	}
 
 	_, err = rand.Read(cmsg[24:32])

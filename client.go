@@ -123,7 +123,7 @@ func (c *Session) ListSharenames() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer fs.Umount()
+	defer func() { _ = fs.Umount() }()
 
 	fs = fs.WithContext(c.ctx)
 
@@ -131,7 +131,7 @@ func (c *Session) ListSharenames() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	callId := rand.Uint32()
 
@@ -335,7 +335,10 @@ func (fs *Share) OpenFile(name string, flag int, perm os.FileMode) (*File, error
 		return nil, &os.PathError{Op: "open", Path: name, Err: err}
 	}
 	if flag&os.O_APPEND != 0 {
-		f.seek(0, io.SeekEnd)
+		if _, err := f.seek(0, io.SeekEnd); err != nil {
+			_ = f.close()
+			return nil, &os.PathError{Op: "open", Path: name, Err: err}
+		}
 	}
 	return f, nil
 }
@@ -597,8 +600,8 @@ func (fs *Share) Symlink(target, linkpath string) error {
 
 	_, err = f.ioctl(req)
 	if err != nil {
-		f.remove()
-		f.close()
+		_ = f.remove()
+		_ = f.close()
 
 		return &os.PathError{Op: "symlink", Path: f.name, Err: err}
 	}
@@ -799,7 +802,7 @@ func (fs *Share) ReadDir(dirname string) ([]os.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	fis, err := f.Readdir(-1)
 	if err != nil {
@@ -821,7 +824,7 @@ func (fs *Share) ReadFile(filename string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	size64 := f.fileStat.Size() + 1 // one byte for final read at EOF
 
@@ -2087,8 +2090,8 @@ func (f *File) copyTo(wf *File) (supported bool, n int64, err error) {
 			if plan.copied == 0 && copychunkUnsupported(err) {
 				// Nothing was written, so both handles can go back to where the
 				// caller left them and the copy can be streamed instead.
-				f.seek(off, io.SeekStart)
-				wf.seek(woff, io.SeekStart)
+				_, _ = f.seek(off, io.SeekStart)
+				_, _ = wf.seek(woff, io.SeekStart)
 				return false, -1, nil
 			}
 

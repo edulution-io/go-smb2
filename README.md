@@ -17,7 +17,7 @@ Installation
 Documentation
 -------------
 
-http://godoc.org/github.com/edulution-io/go-smb2
+https://pkg.go.dev/github.com/edulution-io/go-smb2
 
 Examples
 --------

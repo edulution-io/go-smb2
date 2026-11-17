@@ -313,7 +313,7 @@ func (fs *Share) glob(dir, pattern string, matches []string) (m []string, e erro
 	if err != nil {
 		return // ignore I/O error
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	var names []string
 

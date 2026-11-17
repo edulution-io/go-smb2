@@ -1,12 +1,16 @@
 on: [push, pull_request]
+
+permissions:
+  contents: read
+
 jobs:
   gofmt:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: '1.26'
+        go-version: stable
     - run: |
         unformatted=$(gofmt -l .)
         if [ -n "$unformatted" ]; then
@@ -15,14 +19,36 @@ jobs:
           exit 1
         fi
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: stable
+    - run: go vet ./...
+    - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+      with:
+        version: v2.15.0
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: stable
+        check-latest: true
+    - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
   test_linux:
     strategy:
       matrix:
-        go: ['1.25', '1.26']
+        go: ['1.26', '1.27']
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: ${{ matrix.go }}
         # Replaces the separate actions/cache step. The v1 and v2 cache
@@ -51,16 +77,16 @@ jobs:
         go: [1.11, 1.17]
     runs-on: windows-latest
     steps:
-    - uses: actions/setup-go@v3
+    - uses: actions/setup-go@be3c94b385c4f180051c996d336f57a34c397495 # v3
       with:
         go-version: ${{ matrix.go }}
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@a37ce9120846195fa4ece8f58b268e6043cb2f26 # v3
     - run: |
         mkdir C:\tmp
         net user smbuser Smbpasswd12345 /add
         net share tmp="C:\tmp" /GRANT:smbuser,full
         net share tmp2="C:\tmp" /GRANT:smbuser,read
-    - uses: actions/cache@v2
+    - uses: actions/cache@8492260343ad570701412c2f464a5877dc76bace # v2
       with:
         path: |
           ~/go/pkg/mod

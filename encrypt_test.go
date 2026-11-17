@@ -38,6 +38,12 @@ func encryptingConn(tb testing.TB, cipherId uint16) *conn {
 	return c
 }
 
+// prepareRequest registers and encodes req as sendWith does, without sending.
+func prepareRequest(c *conn, req Packet) (*requestResponse, error) {
+	rr := c.registerRequest(req, nil, context.Background())
+	return rr, c.encodeRequest(rr, req)
+}
+
 func writeRequest(size int) *WriteRequest {
 	req := &WriteRequest{FileId: &FileId{}, Data: bytes.Repeat([]byte{0xab}, size)}
 	req.CreditCharge = 1
@@ -51,7 +57,7 @@ func TestEncryptedRequestRoundTrip(t *testing.T) {
 		c := encryptingConn(t, cipherId)
 		req := writeRequest(4096)
 
-		rr, err := c.makeRequestResponse(req, nil, context.Background())
+		rr, err := prepareRequest(c, req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -80,7 +86,7 @@ func BenchmarkEncryptedWriteRequest(b *testing.B) {
 			b.SetBytes(int64(sz.size))
 			b.ReportAllocs()
 			for b.Loop() {
-				rr, err := c.makeRequestResponse(req, nil, context.Background())
+				rr, err := prepareRequest(c, req)
 				if err != nil {
 					b.Fatal(err)
 				}

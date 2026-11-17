@@ -48,14 +48,7 @@ func (t *fakeTransport) Close() error {
 // newFakeConn starts a conn's sender and receiver over t, as negotiate does.
 func newFakeConn(t *testing.T, tr *fakeTransport) *conn {
 	t.Helper()
-	c := &conn{
-		t:                   tr,
-		outstandingRequests: newOutstandingRequests(),
-		account:             openAccount(64),
-		rdone:               make(chan struct{}, 1),
-		wdone:               make(chan struct{}, 1),
-		write:               make(chan *outgoing, 1),
-	}
+	c := newConn(tr, openAccount(64))
 	go c.runSender()
 	go c.runReciever()
 	t.Cleanup(func() { _ = tr.Close() })

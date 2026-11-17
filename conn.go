@@ -117,15 +117,20 @@ func (n *Negotiator) makeRequest() (*NegotiateRequest, error) {
 	return req, nil
 }
 
-func (n *Negotiator) negotiate(t transport, a *account, ctx context.Context) (*conn, error) {
-	conn := &conn{
+// newConn returns a conn whose sender and receiver are not started yet.
+func newConn(t transport, a *account) *conn {
+	return &conn{
 		t:                   t,
 		outstandingRequests: newOutstandingRequests(),
 		account:             a,
 		rdone:               make(chan struct{}, 1),
 		wdone:               make(chan struct{}, 1),
-		write:               make(chan *outgoing, 1),
+		write:               make(chan *outgoing), // unbuffered, see sendWith
 	}
+}
+
+func (n *Negotiator) negotiate(t transport, a *account, ctx context.Context) (*conn, error) {
+	conn := newConn(t, a)
 
 	go conn.runSender()
 	go conn.runReciever()
@@ -400,26 +405,38 @@ func (conn *conn) send(req Packet, ctx context.Context) (rr *requestResponse, er
 
 func (conn *conn) sendWith(req Packet, tc *treeConn, ctx context.Context) (rr *requestResponse, err error) {
 	conn.m.Lock()
-	defer conn.m.Unlock()
 
 	if conn.err != nil {
+		conn.m.Unlock()
+
 		return nil, conn.err
 	}
 
 	select {
 	case <-ctx.Done():
+		conn.m.Unlock()
+
 		return nil, &ContextError{Err: ctx.Err()}
 	default:
 		// do nothing
 	}
 
-	rr, err = conn.makeRequestResponse(req, tc, ctx)
-	if err != nil {
+	rr = conn.registerRequest(req, tc, ctx)
+
+	conn.m.Unlock()
+
+	// Encoding, signing and encrypting run outside the lock, so goroutines
+	// sharing the connection prepare their requests in parallel.
+	if err := conn.encodeRequest(rr, req); err != nil {
+		conn.outstandingRequests.pop(rr.msgId)
+
 		return nil, err
 	}
 
 	out := &outgoing{pkt: rr.pkt, err: make(chan error, 1)}
 
+	// conn.write is unbuffered: once the sender has taken the request, it
+	// always reports the write, even if the receiver stops meanwhile.
 	select {
 	case conn.write <- out:
 		select {
@@ -434,6 +451,13 @@ func (conn *conn) sendWith(req Packet, tc *treeConn, ctx context.Context) (rr *r
 
 			return nil, &ContextError{Err: ctx.Err()}
 		}
+	case <-conn.wdone:
+		// The receiver stopped after this request was registered; without the
+		// lock held, the sender may be gone too. conn.err is set before wdone
+		// is closed and names why.
+		conn.outstandingRequests.pop(rr.msgId)
+
+		return nil, conn.err
 	case <-ctx.Done():
 		conn.outstandingRequests.pop(rr.msgId)
 
@@ -443,7 +467,9 @@ func (conn *conn) sendWith(req Packet, tc *treeConn, ctx context.Context) (rr *r
 	return rr, nil
 }
 
-func (conn *conn) makeRequestResponse(req Packet, tc *treeConn, ctx context.Context) (rr *requestResponse, err error) {
+// registerRequest assigns the message id and credits and registers the
+// request; the caller holds conn.m.
+func (conn *conn) registerRequest(req Packet, tc *treeConn, ctx context.Context) *requestResponse {
 	hdr := req.Header()
 
 	var msgId uint64
@@ -473,20 +499,52 @@ func (conn *conn) makeRequestResponse(req Packet, tc *treeConn, ctx context.Cont
 		}
 	}
 
-	var pkt []byte
-	var encrypted, signed bool
-
-	if s != nil {
-		if _, ok := req.(*SessionSetupRequest); !ok {
-			if conn.requireEncryption || s.sessionFlags&SMB2_SESSION_FLAG_ENCRYPT_DATA != 0 || (tc != nil && tc.shareFlags&SMB2_SHAREFLAG_ENCRYPT_DATA != 0) {
-				encrypted = true
-			} else {
-				signed = s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0
-			}
-		}
+	// encrypted is set before the request is registered: from then on the
+	// receiver may match a response to it, before encodeRequest has run.
+	rr := &requestResponse{
+		msgId:         msgId,
+		creditRequest: hdr.CreditRequestResponse,
+		ctx:           ctx,
+		recv:          make(chan []byte, 1),
+		encrypted:     conn.encrypts(req, tc),
 	}
 
-	if encrypted {
+	conn.outstandingRequests.set(msgId, rr)
+
+	return rr
+}
+
+// signs reports whether req goes out signed; encrypted requests are not.
+func (conn *conn) signs(req Packet) bool {
+	s := conn.session
+	if s == nil {
+		return false
+	}
+	if _, ok := req.(*SessionSetupRequest); ok {
+		return false
+	}
+	return s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0
+}
+
+// encrypts reports whether req goes out encrypted.
+func (conn *conn) encrypts(req Packet, tc *treeConn) bool {
+	s := conn.session
+	if s == nil {
+		return false
+	}
+	if _, ok := req.(*SessionSetupRequest); ok {
+		return false
+	}
+	return conn.requireEncryption || s.sessionFlags&SMB2_SESSION_FLAG_ENCRYPT_DATA != 0 || (tc != nil && tc.shareFlags&SMB2_SHAREFLAG_ENCRYPT_DATA != 0)
+}
+
+// encodeRequest encodes, then signs or encrypts the request into rr.pkt.
+func (conn *conn) encodeRequest(rr *requestResponse, req Packet) (err error) {
+	s := conn.session
+
+	var pkt []byte
+
+	if rr.encrypted {
 		// Encoded behind the transform header so that it is sealed in place.
 		pkt = s.newTransformBuffer(req.Size())
 
@@ -494,30 +552,21 @@ func (conn *conn) makeRequestResponse(req Packet, tc *treeConn, ctx context.Cont
 
 		pkt, err = s.encryptInPlace(pkt)
 		if err != nil {
-			return nil, &InternalError{err.Error()}
+			return &InternalError{err.Error()}
 		}
 	} else {
 		pkt = make([]byte, req.Size())
 
 		req.Encode(pkt)
 
-		if signed {
+		if conn.signs(req) {
 			pkt = s.sign(pkt)
 		}
 	}
 
-	rr = &requestResponse{
-		msgId:         msgId,
-		creditRequest: hdr.CreditRequestResponse,
-		pkt:           pkt,
-		ctx:           ctx,
-		recv:          make(chan []byte, 1),
-		encrypted:     encrypted,
-	}
+	rr.pkt = pkt
 
-	conn.outstandingRequests.set(msgId, rr)
-
-	return rr, nil
+	return nil
 }
 
 func (conn *conn) recv(rr *requestResponse) ([]byte, error) {

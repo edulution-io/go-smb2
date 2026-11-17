@@ -11,9 +11,9 @@ type treeConn struct {
 	*session
 	treeId     uint32
 	shareFlags uint32
+	shareType  uint8
 
 	// path string
-	// shareType  uint8
 	// capabilities uint32
 	// maximalAccess uint32
 }
@@ -50,8 +50,8 @@ func treeConnect(s *session, path string, flags uint16, ctx context.Context) (*t
 		session:    s,
 		treeId:     PacketCodec(pkt).TreeId(),
 		shareFlags: r.ShareFlags(),
+		shareType:  r.ShareType(),
 		// path:    path,
-		// shareType:  r.ShareType(),
 		// capabilities: r.Capabilities(),
 		// maximalAccess: r.MaximalAccess(),
 	}

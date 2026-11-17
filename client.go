@@ -123,7 +123,8 @@ func (c *Session) ListSharenames() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = fs.Umount() }()
+	// Pass the mounted share so Umount keeps its background context after fs is rebound.
+	defer func(fs *Share) { _ = fs.Umount() }(fs)
 
 	fs = fs.WithContext(c.ctx)
 

@@ -461,7 +461,8 @@ func (s *Session) lookupSidsRPC(sids map[string]*Sid) (map[string]SidName, error
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = fs.Umount() }()
+	// Pass the mounted share so Umount keeps its background context after fs is rebound.
+	defer func(fs *Share) { _ = fs.Umount() }(fs)
 
 	fs = fs.WithContext(s.ctx)
 

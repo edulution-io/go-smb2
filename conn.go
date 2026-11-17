@@ -473,26 +473,36 @@ func (conn *conn) makeRequestResponse(req Packet, tc *treeConn, ctx context.Cont
 		}
 	}
 
-	pkt := make([]byte, req.Size())
-
-	req.Encode(pkt)
-
-	var encrypted bool
+	var pkt []byte
+	var encrypted, signed bool
 
 	if s != nil {
 		if _, ok := req.(*SessionSetupRequest); !ok {
 			if conn.requireEncryption || s.sessionFlags&SMB2_SESSION_FLAG_ENCRYPT_DATA != 0 || (tc != nil && tc.shareFlags&SMB2_SHAREFLAG_ENCRYPT_DATA != 0) {
 				encrypted = true
-
-				pkt, err = s.encrypt(pkt)
-				if err != nil {
-					return nil, &InternalError{err.Error()}
-				}
 			} else {
-				if s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 {
-					pkt = s.sign(pkt)
-				}
+				signed = s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0
 			}
+		}
+	}
+
+	if encrypted {
+		// Encoded behind the transform header so that it is sealed in place.
+		pkt = s.newTransformBuffer(req.Size())
+
+		req.Encode(pkt[transformHeaderSize:])
+
+		pkt, err = s.encryptInPlace(pkt)
+		if err != nil {
+			return nil, &InternalError{err.Error()}
+		}
+	} else {
+		pkt = make([]byte, req.Size())
+
+		req.Encode(pkt)
+
+		if signed {
+			pkt = s.sign(pkt)
 		}
 	}
 

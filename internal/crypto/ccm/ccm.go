@@ -81,9 +81,11 @@ func (ccm *ccm) Seal(dst, nonce, plaintext, data []byte) []byte {
 
 	ctr := cipher.NewCTR(ccm.c, Ctr)
 
-	ctr.XORKeyStream(ciphertext, plaintext)
-
+	// The tag is taken before encrypting, so that plaintext[:0] can be passed
+	// as dst to encrypt in place, as cipher.AEAD allows.
 	T := ccm.getTag(Ctr, data, plaintext)
+
+	ctr.XORKeyStream(ciphertext, plaintext)
 
 	xorBytes(S0, S0, T) // T^S0
 

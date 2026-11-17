@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
+	"errors"
 	"fmt"
 	"hash"
 
@@ -381,15 +382,35 @@ func (s *session) verify(pkt []byte) (ok bool) {
 	return hmac.Equal(signature, p.Signature())
 }
 
+const transformHeaderSize = 52
+
+// newTransformBuffer returns a buffer for a message of size bytes that
+// encryptInPlace can seal: header room in front, room for the tag behind.
+func (s *session) newTransformBuffer(size int) []byte {
+	return make([]byte, transformHeaderSize+size, transformHeaderSize+size+s.encrypter.Overhead())
+}
+
+// encrypt seals pkt into a new transform message.
 func (s *session) encrypt(pkt []byte) ([]byte, error) {
+	c := s.newTransformBuffer(len(pkt))
+	copy(c[transformHeaderSize:], pkt)
+	return s.encryptInPlace(c)
+}
+
+// encryptInPlace seals the message that follows the transform header room in
+// c, a buffer from newTransformBuffer, without copying it.
+func (s *session) encryptInPlace(c []byte) ([]byte, error) {
+	pkt := c[transformHeaderSize:]
+	if cap(pkt)-len(pkt) < s.encrypter.Overhead() {
+		return nil, errors.New("no room for the encryption tag")
+	}
+
 	nonce := make([]byte, s.encrypter.NonceSize())
 
 	_, err := rand.Read(nonce)
 	if err != nil {
 		return nil, err
 	}
-
-	c := make([]byte, 52+len(pkt)+16)
 
 	t := TransformCodec(c)
 
@@ -399,11 +420,9 @@ func (s *session) encrypt(pkt []byte) ([]byte, error) {
 	t.SetFlags(Encrypted)
 	t.SetSessionId(s.sessionId)
 
-	s.encrypter.Seal(c[:52], nonce, pkt, t.AssociatedData())
+	sealed := s.encrypter.Seal(pkt[:0], nonce, pkt, t.AssociatedData())
 
-	t.SetSignature(c[len(c)-16:])
-
-	c = c[:len(c)-16]
+	t.SetSignature(sealed[len(pkt):])
 
 	return c, nil
 }

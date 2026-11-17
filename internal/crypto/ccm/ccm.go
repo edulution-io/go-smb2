@@ -11,7 +11,6 @@ import (
 
 type ccm struct {
 	c         cipher.Block
-	mac       *mac
 	nonceSize int
 	tagSize   int
 }
@@ -42,7 +41,6 @@ func NewCCMWithNonceAndTagSizes(c cipher.Block, nonceSize, tagSize int) (cipher.
 
 	return &ccm{
 		c:         c,
-		mac:       newMAC(c),
 		nonceSize: nonceSize,
 		tagSize:   tagSize,
 	}, nil
@@ -67,7 +65,7 @@ func (ccm *ccm) Seal(dst, nonce, plaintext, data []byte) []byte {
 		return nil
 	}
 
-	ret, ciphertext := sliceForAppend(dst, len(plaintext)+ccm.mac.Size())
+	ret, ciphertext := sliceForAppend(dst, len(plaintext)+ccm.c.BlockSize())
 
 	// Formatting of the Counter Blocks are defined in A.3.
 	Ctr := make([]byte, 16)               // Ctr0
@@ -81,9 +79,11 @@ func (ccm *ccm) Seal(dst, nonce, plaintext, data []byte) []byte {
 
 	ctr := cipher.NewCTR(ccm.c, Ctr)
 
-	ctr.XORKeyStream(ciphertext, plaintext)
-
+	// The tag is taken before encrypting, so that plaintext[:0] can be passed
+	// as dst to encrypt in place, as cipher.AEAD allows.
 	T := ccm.getTag(Ctr, data, plaintext)
+
+	ctr.XORKeyStream(ciphertext, plaintext)
 
 	xorBytes(S0, S0, T) // T^S0
 
@@ -134,8 +134,10 @@ func (ccm *ccm) Open(dst, nonce, ciphertext, data []byte) ([]byte, error) {
 
 // getTag reuses a Ctr block for making the B0 block because of some parts are the same.
 // For more details, see A.2 and A.3.
+// getTag uses a MAC of its own, so that one ccm seals and opens concurrently,
+// as a cipher.AEAD may.
 func (ccm *ccm) getTag(Ctr, data, plaintext []byte) []byte {
-	ccm.mac.Reset()
+	mac := newMAC(ccm.c)
 
 	B := Ctr                                                // B0
 	B[0] |= byte(((ccm.tagSize - 2) / 2) << 3)              // [(t-2)/2]3
@@ -144,35 +146,35 @@ func (ccm *ccm) getTag(Ctr, data, plaintext []byte) []byte {
 	if len(data) > 0 {
 		B[0] |= 1 << 6 // Adata
 
-		ccm.mac.Write(B)
+		mac.Write(B)
 
 		if len(data) < (1<<15 - 1<<7) {
 			putUvarint(B[:2], uint64(len(data)))
 
-			ccm.mac.Write(B[:2])
+			mac.Write(B[:2])
 		} else if len(data) <= 1<<31-1 {
 			B[0] = 0xff
 			B[1] = 0xfe
 			putUvarint(B[2:6], uint64(len(data)))
 
-			ccm.mac.Write(B[:6])
+			mac.Write(B[:6])
 		} else {
 			B[0] = 0xff
 			B[1] = 0xff
 			putUvarint(B[2:10], uint64(len(data)))
 
-			ccm.mac.Write(B[:10])
+			mac.Write(B[:10])
 		}
-		ccm.mac.Write(data)
-		ccm.mac.PadZero()
+		mac.Write(data)
+		mac.PadZero()
 	} else {
-		ccm.mac.Write(B)
+		mac.Write(B)
 	}
 
-	ccm.mac.Write(plaintext)
-	ccm.mac.PadZero()
+	mac.Write(plaintext)
+	mac.PadZero()
 
-	return ccm.mac.Sum(nil)
+	return mac.Sum(nil)
 }
 
 func maxUvarint(n int) uint64 {

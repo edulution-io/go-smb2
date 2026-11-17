@@ -8,8 +8,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
+	"errors"
 	"fmt"
 	"hash"
+	"sync"
 
 	"github.com/edulution-io/go-smb2/internal/crypto/ccm"
 	"github.com/edulution-io/go-smb2/internal/crypto/cmac"
@@ -159,7 +161,7 @@ func sessionSetup(conn *conn, i Initiator, ctx context.Context) (*session, error
 func (s *session) deriveKeys(sessionKey, finalReq []byte) error {
 	switch s.dialect {
 	case SMB202, SMB210:
-		s.signer = hmac.New(sha256.New, sessionKey)
+		s.newSigner = func() hash.Hash { return hmac.New(sha256.New, sessionKey) }
 		s.verifier = hmac.New(sha256.New, sessionKey)
 	case SMB300, SMB302:
 		signingKey := kdf(sessionKey, []byte("SMB2AESCMAC\x00"), []byte("SmbSign\x00"))
@@ -167,7 +169,8 @@ func (s *session) deriveKeys(sessionKey, finalReq []byte) error {
 		if err != nil {
 			return &InternalError{err.Error()}
 		}
-		s.signer = cmac.New(ciph)
+		signingCipher := ciph // ciph is reused for the encryption keys below
+		s.newSigner = func() hash.Hash { return cmac.New(signingCipher) }
 		s.verifier = cmac.New(ciph)
 
 		// s.applicationKey = kdf(sessionKey, []byte("SMB2APP\x00"), []byte("SmbRpc\x00"))
@@ -206,7 +209,7 @@ func (s *session) deriveKeys(sessionKey, finalReq []byte) error {
 		if err != nil {
 			return &InternalError{err.Error()}
 		}
-		s.signer = cmac.New(ciph)
+		s.newSigner = func() hash.Hash { return cmac.New(ciph) }
 		s.verifier = cmac.New(ciph)
 
 		// s.applicationKey = kdf(sessionKey, []byte("SMBAppKey\x00"), preauthIntegrityHashValue)
@@ -289,7 +292,10 @@ type session struct {
 	sessionId                 uint64
 	preauthIntegrityHashValue [64]byte
 
-	signer    hash.Hash
+	// newSigner makes the signing hashes that sign pools, so that senders
+	// sign in parallel; the receiver alone uses verifier.
+	newSigner func() hash.Hash
+	signers   sync.Pool
 	verifier  hash.Hash
 	encrypter cipher.AEAD
 	decrypter cipher.AEAD
@@ -352,7 +358,11 @@ func (s *session) sign(pkt []byte) []byte {
 
 	p.SetFlags(p.Flags() | SMB2_FLAGS_SIGNED)
 
-	h := s.signer
+	h, _ := s.signers.Get().(hash.Hash)
+	if h == nil {
+		h = s.newSigner()
+	}
+	defer s.signers.Put(h)
 
 	h.Reset()
 
@@ -381,15 +391,35 @@ func (s *session) verify(pkt []byte) (ok bool) {
 	return hmac.Equal(signature, p.Signature())
 }
 
+const transformHeaderSize = 52
+
+// newTransformBuffer returns a buffer for a message of size bytes that
+// encryptInPlace can seal: header room in front, room for the tag behind.
+func (s *session) newTransformBuffer(size int) []byte {
+	return make([]byte, transformHeaderSize+size, transformHeaderSize+size+s.encrypter.Overhead())
+}
+
+// encrypt seals pkt into a new transform message.
 func (s *session) encrypt(pkt []byte) ([]byte, error) {
+	c := s.newTransformBuffer(len(pkt))
+	copy(c[transformHeaderSize:], pkt)
+	return s.encryptInPlace(c)
+}
+
+// encryptInPlace seals the message that follows the transform header room in
+// c, a buffer from newTransformBuffer, without copying it.
+func (s *session) encryptInPlace(c []byte) ([]byte, error) {
+	pkt := c[transformHeaderSize:]
+	if cap(pkt)-len(pkt) < s.encrypter.Overhead() {
+		return nil, errors.New("no room for the encryption tag")
+	}
+
 	nonce := make([]byte, s.encrypter.NonceSize())
 
 	_, err := rand.Read(nonce)
 	if err != nil {
 		return nil, err
 	}
-
-	c := make([]byte, 52+len(pkt)+16)
 
 	t := TransformCodec(c)
 
@@ -399,11 +429,9 @@ func (s *session) encrypt(pkt []byte) ([]byte, error) {
 	t.SetFlags(Encrypted)
 	t.SetSessionId(s.sessionId)
 
-	s.encrypter.Seal(c[:52], nonce, pkt, t.AssociatedData())
+	sealed := s.encrypter.Seal(pkt[:0], nonce, pkt, t.AssociatedData())
 
-	t.SetSignature(c[len(c)-16:])
-
-	c = c[:len(c)-16]
+	t.SetSignature(sealed[len(pkt):])
 
 	return c, nil
 }

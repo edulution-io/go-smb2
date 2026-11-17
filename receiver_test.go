@@ -157,3 +157,40 @@ func TestTryVerify_RejectsASignedFrameWithoutAVerifier(t *testing.T) {
 		t.Error("tryVerify = nil error, want a rejection")
 	}
 }
+
+type panickingTransport struct{ transport }
+
+func (panickingTransport) ReadSize() (int, error) { panic("parser bug") }
+
+// TestReceiver_FailsTheConnectionInsteadOfPanicking pins that a panic in the
+// receiver goroutine, which no caller can recover, ends only this connection.
+func TestReceiver_FailsTheConnectionInsteadOfPanicking(t *testing.T) {
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	c := &conn{
+		t:                   panickingTransport{direct(client)},
+		outstandingRequests: newOutstandingRequests(),
+		rdone:               make(chan struct{}, 1),
+		wdone:               make(chan struct{}, 1),
+	}
+	done := make(chan struct{})
+	go func() {
+		c.runReciever()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the receiver kept running after a panic")
+	}
+	c.m.Lock()
+	defer c.m.Unlock()
+	if _, ok := c.err.(*InvalidResponseError); !ok {
+		t.Errorf("conn.err = %#v, want an *InvalidResponseError", c.err)
+	}
+	select {
+	case <-c.wdone:
+	default:
+		t.Error("wdone was not closed, so a waiting sender would hang")
+	}
+}

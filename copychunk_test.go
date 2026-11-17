@@ -239,17 +239,19 @@ func TestCopychunkPlannerNarrowsWithoutLosingProgress(t *testing.T) {
 	assertCovers(t, all, 0, 0, size)
 }
 
+// copychunkResponse builds an SRV_COPYCHUNK_RESPONSE carrying the server's limits.
+func copychunkResponse(chunks, chunkSize, total uint32) []byte {
+	b := make([]byte, 12)
+	binary.LittleEndian.PutUint32(b[0:4], chunks)
+	binary.LittleEndian.PutUint32(b[4:8], chunkSize)
+	binary.LittleEndian.PutUint32(b[8:12], total)
+	return b
+}
+
 func TestCopychunkLimitsFrom(t *testing.T) {
-	response := func(chunks, chunkSize, total uint32) []byte {
-		b := make([]byte, 12)
-		binary.LittleEndian.PutUint32(b[0:4], chunks)
-		binary.LittleEndian.PutUint32(b[4:8], chunkSize)
-		binary.LittleEndian.PutUint32(b[8:12], total)
-		return b
-	}
 
 	t.Run("limits the server sent", func(t *testing.T) {
-		l, ok := copychunkLimitsFrom(response(4, 512, 2048))
+		l, ok := copychunkLimitsFrom(copychunkResponse(4, 512, 2048))
 		if !ok {
 			t.Fatal("rejected a well-formed response")
 		}
@@ -267,9 +269,9 @@ func TestCopychunkLimitsFrom(t *testing.T) {
 	// A zero in any field would plan requests that copy nothing, forever.
 	t.Run("a zero limit is not usable", func(t *testing.T) {
 		for i, r := range [][]byte{
-			response(0, 512, 2048),
-			response(4, 0, 2048),
-			response(4, 512, 0),
+			copychunkResponse(0, 512, 2048),
+			copychunkResponse(4, 0, 2048),
+			copychunkResponse(4, 512, 0),
 		} {
 			if _, ok := copychunkLimitsFrom(r); ok {
 				t.Fatalf("case %d: accepted limits that allow no progress", i)

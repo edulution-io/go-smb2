@@ -23,3 +23,12 @@ const (
 const (
 	clientMaxSymlinkDepth = 8
 )
+
+// Dialects for Negotiator.SpecifiedDialect and Negotiator.MinDialect.
+const (
+	Dialect202 uint16 = SMB202
+	Dialect210 uint16 = SMB210
+	Dialect300 uint16 = SMB300
+	Dialect302 uint16 = SMB302
+	Dialect311 uint16 = SMB311
+)

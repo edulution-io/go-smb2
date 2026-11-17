@@ -70,14 +70,6 @@ func sessionSetup(conn *conn, i Initiator, ctx context.Context) (*session, error
 	}
 
 	sessionFlags := r.SessionFlags()
-	if conn.requireSigning {
-		if sessionFlags&SMB2_SESSION_FLAG_IS_GUEST != 0 {
-			return nil, &InvalidResponseError{"guest account doesn't support signing"}
-		}
-		if sessionFlags&SMB2_SESSION_FLAG_IS_NULL != 0 {
-			return nil, &InvalidResponseError{"anonymous account doesn't support signing"}
-		}
-	}
 
 	s := &session{
 		conn:           conn,
@@ -245,10 +237,39 @@ func sessionSetup(conn *conn, i Initiator, ctx context.Context) (*session, error
 
 	s.sessionFlags = r.SessionFlags()
 
+	if err := s.verifySessionSetup(pkt); err != nil {
+		return nil, err
+	}
+
 	// now, allow access from receiver
 	s.enableSession()
 
 	return s, nil
+}
+
+// verifySessionSetup checks the final SESSION_SETUP response, which the
+// receiver does not verify because the session is not enabled yet. For SMB
+// 3.1.1 its signature is what proves that the negotiation was not altered.
+func (s *session) verifySessionSetup(pkt []byte) error {
+	if s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) != 0 {
+		if s.requireSigning || s.requireEncryption {
+			return &InvalidResponseError{"guest or anonymous session cannot be signed or encrypted"}
+		}
+		return nil
+	}
+
+	if PacketCodec(pkt).Flags()&SMB2_FLAGS_SIGNED == 0 {
+		if s.dialect == SMB311 || s.requireSigning {
+			return &InvalidResponseError{"unsigned session setup response"}
+		}
+		return nil
+	}
+
+	if !s.verify(pkt) {
+		return &InvalidResponseError{"unverified session setup response"}
+	}
+
+	return nil
 }
 
 type session struct {

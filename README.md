@@ -19,6 +19,26 @@ Documentation
 
 http://godoc.org/github.com/edulution-io/go-smb2
 
+Security
+--------
+
+By default the client negotiates any dialect from SMB 2.0.2 to 3.1.1 and signs
+or encrypts only when the server asks for it. Against an untrusted network,
+require SMB 3.1.1 and encryption:
+
+```go
+d := &smb2.Dialer{
+	Negotiator: smb2.Negotiator{
+		MinDialect:        smb2.Dialect311,
+		RequireEncryption: true,
+	},
+	Initiator: &smb2.NTLMInitiator{User: "USERNAME", Password: "PASSWORD"},
+}
+```
+
+`MinDialect` stops a downgrade to an older dialect, `RequireEncryption` encrypts
+every request after session setup and rejects unencrypted responses to them.
+
 Examples
 --------
 
